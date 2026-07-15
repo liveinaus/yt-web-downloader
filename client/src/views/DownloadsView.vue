@@ -46,51 +46,73 @@ async function submit(): Promise<void> {
 </script>
 
 <template>
-  <div class="panel">
-    <form class="add-form" @submit.prevent="submit">
-      <input v-model="url" type="url" placeholder="Paste a video or playlist URL…" required />
-      <select v-model="preset">
-        <option v-for="p in presets" :key="p" :value="p">{{ p }}</option>
-      </select>
-      <label class="check">
-        <input v-model="playlist" type="checkbox" />
-        Playlist
-      </label>
-      <div class="dest-toggle">
-        <button
-          type="button"
-          :class="{ active: destination === 'server' }"
-          @click="destination = 'server'"
-        >
-          Save to server
-        </button>
-        <button
-          type="button"
-          :class="{ active: destination === 'direct' }"
-          @click="destination = 'direct'"
-        >
-          Direct to device
-        </button>
-      </div>
-      <button class="primary" type="submit" :disabled="submitting">Download</button>
-    </form>
-    <p v-if="error" class="notice err">{{ error }}</p>
+  <div class="card mb-4">
+    <div class="card-body">
+      <form class="row g-2 align-items-center" @submit.prevent="submit">
+        <div class="col-12 col-md">
+          <input
+            v-model="url"
+            class="form-control"
+            type="url"
+            placeholder="Paste a video or playlist URL…"
+            required
+          />
+        </div>
+        <div class="col-auto">
+          <select v-model="preset" class="form-select">
+            <option v-for="p in presets" :key="p" :value="p">{{ p }}</option>
+          </select>
+        </div>
+        <div class="col-auto">
+          <div class="form-check">
+            <input id="playlist-check" v-model="playlist" class="form-check-input" type="checkbox" />
+            <label class="form-check-label" for="playlist-check">Playlist</label>
+          </div>
+        </div>
+        <div class="col-auto">
+          <div class="btn-group" role="group">
+            <button
+              type="button"
+              class="btn btn-sm"
+              :class="destination === 'server' ? 'btn-primary' : 'btn-outline-secondary'"
+              @click="destination = 'server'"
+            >
+              Save to server
+            </button>
+            <button
+              type="button"
+              class="btn btn-sm"
+              :class="destination === 'direct' ? 'btn-primary' : 'btn-outline-secondary'"
+              @click="destination = 'direct'"
+            >
+              Direct to device
+            </button>
+          </div>
+        </div>
+        <div class="col-auto">
+          <button class="btn btn-primary" type="submit" :disabled="submitting">Download</button>
+        </div>
+      </form>
+      <div v-if="error" class="alert alert-danger mt-3 mb-0 py-2">{{ error }}</div>
+    </div>
   </div>
 
-  <div class="section-head">
-    <h2>Active ({{ active.length }})</h2>
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <h2 class="h5 mb-0">Active ({{ active.length }})</h2>
   </div>
-  <div class="cards">
+  <div>
     <DownloadCard v-for="d in active" :key="d.id" :download="d" />
-    <p v-if="!active.length" class="empty">No active downloads</p>
+    <p v-if="!active.length" class="text-body-secondary text-center py-4">No active downloads</p>
   </div>
 
-  <div class="section-head">
-    <h2>History ({{ finished.length }})</h2>
-    <button v-if="finished.length" class="ghost" @click="api.clearFinished()">Clear all</button>
+  <div class="d-flex justify-content-between align-items-center mb-2 mt-4">
+    <h2 class="h5 mb-0">History ({{ finished.length }})</h2>
+    <button v-if="finished.length" class="btn btn-outline-secondary btn-sm" @click="api.clearFinished()">
+      Clear all
+    </button>
   </div>
-  <div class="cards">
+  <div>
     <DownloadCard v-for="d in finished" :key="d.id" :download="d" />
-    <p v-if="!finished.length" class="empty">Nothing here yet</p>
+    <p v-if="!finished.length" class="text-body-secondary text-center py-4">Nothing here yet</p>
   </div>
 </template>

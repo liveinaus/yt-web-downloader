@@ -15,6 +15,9 @@ Vue 3 + Vite frontend with a Node.js (Express + TypeScript) backend, plus built-
 - CookieCloud integration: pulls your encrypted browser cookies from a CookieCloud server,
   decrypts them locally and writes a Netscape `cookies.txt` that is passed to every yt-dlp run
   (manual "Sync now" plus optional interval auto-sync)
+- Password + captcha login (argon2-hashed credentials, JWT sessions, forced change of the
+  default password) and rate-limited login attempts, so the service isn't open to anyone who
+  finds the URL
 
 ## Requirements
 
@@ -29,6 +32,9 @@ docker run -d \
   --name yt-web-downloader \
   -p 3033:3033 \
   -v /docker/yt-web-downloader-data:/app/data \
+  -e JWT_SECRET=$(openssl rand -hex 32) \
+  -e ADMIN_USERNAME=admin \
+  -e ADMIN_PASSWORD=changeme \
   liveinaus/yt-web-downloader:latest
 ```
 
@@ -52,7 +58,9 @@ published to Docker Hub (`liveinaus/yt-web-downloader`) and GHCR
 Starts the backend on port 3033 and the Vite dev server on http://localhost:54444 (proxying
 `/api` and `/ws` to the backend), kills anything already bound to those ports, and stops both on
 Ctrl+C. Ports/hosts can be overridden via `BACKEND_PORT`, `FRONTEND_PORT`, `BACKEND_HOST` and
-`FRONTEND_HOST` env vars. Or run the pieces manually:
+`FRONTEND_HOST` env vars. On first run it copies `server/env.example` to `server/.env` and
+generates a random `JWT_SECRET` for you. The default login is `admin` / `changeme` -- you'll be
+forced to change it on first sign-in. Or run the pieces manually:
 
 ```bash
 npm install
@@ -69,7 +77,28 @@ npm start
 
 The server listens on http://localhost:3033 and serves the built client. Configuration, cookies,
 history and downloads live in `./data` by default (override with the `DATA_DIR` env var; port
-with `PORT`).
+with `PORT`). Copy `server/env.example` to `server/.env` (or export the vars directly) and set a
+real `JWT_SECRET`, `ADMIN_USERNAME` and `ADMIN_PASSWORD` -- see [Authentication](#authentication)
+below.
+
+## Authentication
+
+Every page and API route (other than the login screen itself and `/api/health`) requires signing
+in with a username, password and a captcha:
+
+- Credentials are argon2id-hashed and stored in `data/auth.json` (separate from `config.json`, so
+  the hash never leaks through the general Settings endpoint).
+- Sessions are JWTs (7-day expiry) signed with `JWT_SECRET`, which is **required** -- the server
+  refuses to start without it (or with a known placeholder value). Generate one with
+  `openssl rand -hex 32`.
+- `ADMIN_USERNAME` / `ADMIN_PASSWORD` seed the account on first boot only; once set, change
+  credentials from Settings → Account rather than editing the env vars. Logging in with the
+  literal default password (`changeme`, or whatever `ADMIN_DEFAULT_PASSWORD` is set to) forces a
+  password change before anything else in the app is usable.
+- Logins are rate-limited to 10 attempts per 15 minutes per IP (set `TRUST_PROXY` if the app sits
+  behind a reverse proxy, so rate limiting sees the real client IP instead of the proxy's).
+- The WebSocket used for live download progress authenticates the same JWT over its first
+  message rather than a URL query parameter, so tokens never end up in access logs.
 
 ## Releasing
 

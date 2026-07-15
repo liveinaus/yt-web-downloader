@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '../api'
+import { getToken } from '../auth'
 import type { Download } from '../types'
 
 export const useDownloadsStore = defineStore('downloads', () => {
@@ -43,20 +44,29 @@ export const useDownloadsStore = defineStore('downloads', () => {
 
   function connect(): void {
     if (ws) return
+    const token = getToken()
+    if (!token) return
+
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     ws = new WebSocket(`${proto}://${location.host}/ws`)
 
     ws.onopen = () => {
-      connected.value = true
+      // Authenticate via the first message rather than a URL query param, so
+      // the token never ends up in server access logs
+      ws?.send(JSON.stringify({ type: 'auth', token }))
     }
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data as string) as { type: string; downloads: Download[] }
-      if (msg.type === 'state') applyState(msg.downloads)
+      if (msg.type === 'state') {
+        connected.value = true
+        applyState(msg.downloads)
+      }
     }
     ws.onclose = () => {
       connected.value = false
       ws = null
-      retryTimer = window.setTimeout(connect, 2000)
+      // Don't keep retrying once logged out -- there's no token to auth with
+      if (getToken()) retryTimer = window.setTimeout(connect, 2000)
     }
     ws.onerror = () => ws?.close()
   }

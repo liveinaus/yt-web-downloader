@@ -7,8 +7,15 @@ services:
     volumes:
       # Holds config.json, cookies.txt, history and the downloads folder
       - /docker/yt-web-downloader-data:/app/data
-    # environment:
-    #   # Optional: set a timezone, e.g. TZ=Australia/Sydney (defaults to UTC)
-    #   TZ: ${TZ:-UTC}
-    #   # Optional: override the listen port (defaults to 3033)
-    #   PORT: 3033
+    environment:
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}    # change this
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme} # change this -- you'll be forced to update it on first login
+      # Secret used to sign login tokens. Required: set to a long random string,
+      # e.g. `openssl rand -hex 32`. Compose refuses to start if it is unset.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET to a long random string, e.g. openssl rand -hex 32}
+      # Optional: set a timezone, e.g. TZ=Australia/Sydney (defaults to UTC)
+      # TZ: ${TZ:-UTC}
+      # Optional: override the listen port (defaults to 3033)
+      # PORT: 3033
+      # Optional: set to 1 if this sits behind a reverse proxy (nginx/Caddy/Cloudflare)
+      # TRUST_PROXY: 1

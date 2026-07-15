@@ -1,18 +1,51 @@
+import 'dotenv/config'
 import express from 'express'
 import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer, WebSocket } from 'ws'
+import type { IncomingMessage } from 'node:http'
+import { getJwtSecret, requireAuth, verifySessionToken } from './authMiddleware.js'
+import { authRouter } from './authRoutes.js'
+import { bootstrapCredentials } from './credentials.js'
 import { scheduleAutoSync } from './cookiecloud.js'
 import { manager } from './downloader.js'
 import { api } from './routes.js'
 import type { Download } from './types.js'
 
+// Validate critical env vars and seed the admin account before accepting requests
+getJwtSecret()
+await bootstrapCredentials()
+
 const PORT = Number(process.env.PORT ?? 3033)
+const HOST = process.env.HOST ?? '0.0.0.0'
 
 const app = express()
-app.use('/api', api)
+
+// TRUST_PROXY: number of reverse-proxy hops in front of this app.
+// 0 = direct internet (default); set to 1+ behind nginx/Caddy/Cloudflare so
+// rate limiting and logging see the real client IP instead of the proxy's.
+const trustProxy = process.env.TRUST_PROXY ?? '0'
+app.set('trust proxy', /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy)
+
+app.use(express.json())
+
+// Baseline security headers, dependency-free
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('X-Frame-Options', 'DENY')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'none'")
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+  }
+  next()
+})
+
+app.get('/api/health', (_req, res) => res.json({ status: 'ok' }))
+app.use('/api/auth', authRouter)
+app.use('/api', requireAuth, api)
 
 // Serve the built client when it exists (production mode)
 const clientDist = path.resolve(fileURLToPath(import.meta.url), '../../../client/dist')
@@ -24,8 +57,31 @@ if (fs.existsSync(clientDist)) {
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server, path: '/ws' })
 
-wss.on('connection', (ws) => {
-  ws.send(JSON.stringify({ type: 'state', downloads: manager.list() }))
+wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+  // Authenticate via the first message (not a URL query param) so tokens
+  // never end up in access logs
+  const authTimeout = setTimeout(() => ws.close(1008, 'Auth timeout'), 5_000)
+
+  ws.once('message', (raw: Buffer) => {
+    clearTimeout(authTimeout)
+    let msg: { type?: string; token?: string }
+    try {
+      msg = JSON.parse(raw.toString())
+    } catch {
+      ws.close(1008, 'Invalid auth message')
+      return
+    }
+    if (msg.type !== 'auth' || !msg.token) {
+      ws.close(1008, 'Expected auth message')
+      return
+    }
+    const decoded = verifySessionToken(msg.token)
+    if (!decoded || decoded.requirePasswordChange) {
+      ws.close(1008, 'Unauthorised')
+      return
+    }
+    ws.send(JSON.stringify({ type: 'state', downloads: manager.list() }))
+  })
 })
 
 // Throttle broadcasts so rapid progress lines don't flood clients
@@ -48,6 +104,6 @@ manager.on('update', (downloads: Download[]) => {
 
 scheduleAutoSync()
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   console.log(`yt-web-downloader server listening on http://localhost:${PORT}`)
 })

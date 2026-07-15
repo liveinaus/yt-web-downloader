@@ -12,6 +12,35 @@ PROXY_HOST=127.0.0.1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ── .env setup ────────────────────────────────────────────────────────────────
+if [ ! -f server/.env ]; then
+  cp server/env.example server/.env
+  echo ""
+  echo "Created server/.env from server/env.example."
+  echo ""
+fi
+
+# The server refuses to boot on an empty or publicly-known JWT_SECRET, so
+# generate a random one for local dev if the current value is missing/placeholder.
+if ! grep -q "^JWT_SECRET=." server/.env 2>/dev/null \
+   || grep -qE "^JWT_SECRET=(change-me-in-production|changeme|secret)$" server/.env 2>/dev/null; then
+  SECRET=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  if grep -q "^JWT_SECRET=" server/.env 2>/dev/null; then
+    sed "s|^JWT_SECRET=.*|JWT_SECRET=${SECRET}|" server/.env > server/.env.tmp && mv server/.env.tmp server/.env
+  else
+    printf 'JWT_SECRET=%s\n' "$SECRET" >> server/.env
+  fi
+  echo "Generated a random JWT_SECRET in server/.env for local development."
+  echo ""
+fi
+
+if grep -q "^ADMIN_PASSWORD=changeme$" server/.env 2>/dev/null; then
+  echo ""
+  echo "NOTE: server/.env uses the default ADMIN_PASSWORD (changeme)."
+  echo "      You'll be prompted to change it on first login; set a real one for deployment."
+  echo ""
+fi
+
 # ── Dependencies ──────────────────────────────────────────────────────────────
 echo "Installing dependencies..."
 npm install --no-audit || true

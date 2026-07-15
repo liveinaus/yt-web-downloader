@@ -1,4 +1,4 @@
-import express, { Router } from 'express'
+import { Router } from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
 import { getSettings, updateSettings } from './config.js'
@@ -6,13 +6,9 @@ import { getCookieCloudStatus, scheduleAutoSync, syncCookies } from './cookieclo
 import { manager, PRESETS } from './downloader.js'
 import type { NewDownloadRequest, Settings } from './types.js'
 
+// express.json() is applied once at the app level in index.ts, before this
+// router is mounted, so req.body is already parsed by the time routes run
 export const api: Router = Router()
-
-api.use(express.json())
-
-api.get('/health', (_req, res) => {
-  res.json({ status: 'ok' })
-})
 
 api.get('/downloads', (_req, res) => {
   res.json(manager.list())

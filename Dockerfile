@@ -1,6 +1,8 @@
 # ── Stage 1: Build client + server (npm workspaces) ───────────────────────────
 FROM node:22-alpine AS builder
 WORKDIR /app
+# python3/make/g++ required to compile argon2's native addon on musl/Alpine
+RUN apk add --no-cache python3 make g++
 COPY package*.json ./
 COPY client/package.json client/
 COPY server/package.json server/

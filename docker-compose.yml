@@ -1,0 +1,14 @@
+services:
+  yt-web-downloader:
+    image: liveinaus/yt-web-downloader:latest
+    restart: unless-stopped
+    ports:
+      - "3033:3033"
+    volumes:
+      # Holds config.json, cookies.txt, history and the downloads folder
+      - /docker/yt-web-downloader-data:/app/data
+    # environment:
+    #   # Optional: set a timezone, e.g. TZ=Australia/Sydney (defaults to UTC)
+    #   TZ: ${TZ:-UTC}
+    #   # Optional: override the listen port (defaults to 3033)
+    #   PORT: 3033

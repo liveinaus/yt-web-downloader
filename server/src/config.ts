@@ -10,6 +10,7 @@ const CONFIG_FILE = path.join(DATA_DIR, 'config.json')
 const defaults: Settings = {
   downloadDir: path.join(DATA_DIR, 'downloads'),
   ytdlpPath: 'yt-dlp',
+  ffmpegPath: '',
   extraArgs: '',
   cookieCloud: {
     serverUrl: '',

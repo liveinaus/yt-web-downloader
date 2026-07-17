@@ -29,6 +29,16 @@ export type Download = {
   finishedAt: number | null
 }
 
+export type NewDownloadRequest = {
+  url: string
+  preset: string
+  playlist: boolean
+  destination: Destination
+  subtitles?: boolean
+  subLangs?: string
+  container?: string
+}
+
 export type CookieCloudSettings = {
   serverUrl: string
   uuid: string
@@ -46,6 +56,7 @@ export type CookieCloudStatus = {
 export type Settings = {
   downloadDir: string
   ytdlpPath: string
+  ffmpegPath: string
   extraArgs: string
   cookieCloud: CookieCloudSettings
 }

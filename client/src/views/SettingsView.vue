@@ -157,6 +157,16 @@ function logout(): void {
             <label class="form-label">yt-dlp path</label>
             <input v-model="settings.ytdlpPath" class="form-control" type="text" placeholder="yt-dlp" />
           </div>
+          <div class="col-md-6">
+            <label class="form-label">ffmpeg path</label>
+            <input
+              v-model="settings.ffmpegPath"
+              class="form-control"
+              type="text"
+              placeholder="Bundled static build"
+            />
+            <div class="form-text">Leave blank to use the bundled ffmpeg.</div>
+          </div>
           <div class="col-12">
             <label class="form-label">Extra yt-dlp arguments</label>
             <input

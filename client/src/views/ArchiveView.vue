@@ -2,10 +2,21 @@
 import { onMounted, ref } from 'vue'
 import { api } from '../api'
 import { formatBytes, formatDate } from '../format'
+import { saveBlob } from '../save'
 import type { ArchiveFile } from '../types'
 
 const files = ref<ArchiveFile[]>([])
 const loading = ref(true)
+const error = ref<string | null>(null)
+
+async function download(name: string): Promise<void> {
+  error.value = null
+  try {
+    saveBlob(await api.fetchArchiveFile(name), name)
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err)
+  }
+}
 
 async function refresh(): Promise<void> {
   loading.value = true
@@ -30,6 +41,7 @@ onMounted(refresh)
     <h2 class="h5 mb-0">Downloaded files</h2>
     <button class="btn btn-outline-secondary btn-sm" @click="refresh">Refresh</button>
   </div>
+  <div v-if="error" class="alert alert-danger py-2">{{ error }}</div>
   <div class="card">
     <div class="table-responsive" v-if="files.length">
       <table class="table table-hover align-middle mb-0">
@@ -44,7 +56,7 @@ onMounted(refresh)
         <tbody>
           <tr v-for="f in files" :key="f.name">
             <td class="text-truncate" style="max-width: 380px" :title="f.name">
-              <a :href="`/api/files/${encodeURIComponent(f.name)}`">{{ f.name }}</a>
+              <a href="#" @click.prevent="download(f.name)">{{ f.name }}</a>
             </td>
             <td>{{ formatBytes(f.size) }}</td>
             <td>{{ formatDate(f.modifiedAt) }}</td>

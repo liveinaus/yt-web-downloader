@@ -1,5 +1,11 @@
 import { clearSession, getToken, requirePasswordChangeSignal } from './auth'
-import type { ArchiveFile, CookieCloudStatus, Destination, Download, Settings } from './types'
+import type {
+  ArchiveFile,
+  CookieCloudStatus,
+  Download,
+  NewDownloadRequest,
+  Settings
+} from './types'
 
 async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
   const token = getToken()
@@ -34,6 +40,20 @@ const json = (body: unknown): RequestInit => ({
   body: JSON.stringify(body)
 })
 
+// Fetches a protected file with the auth header. A plain anchor navigation
+// can't carry the bearer token, so the file routes 401 without this.
+async function fetchBlob(url: string): Promise<Blob> {
+  const token = getToken()
+  const headers = new Headers()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const res = await fetch(url, { headers })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    throw new Error(body?.error ?? `Download failed with status ${res.status}`)
+  }
+  return res.blob()
+}
+
 export const authApi = {
   getCaptcha: () => request<{ svg: string; captchaToken: string }>('/api/auth/captcha'),
   login: (username: string, password: string, captchaToken: string, captchaAnswer: string) =>
@@ -50,10 +70,10 @@ export const authApi = {
 
 export const api = {
   listDownloads: () => request<Download[]>('/api/downloads'),
-  addDownload: (url: string, preset: string, playlist: boolean, destination: Destination) =>
+  addDownload: (req: NewDownloadRequest) =>
     request<Download>('/api/downloads', {
       method: 'POST',
-      ...json({ url, preset, playlist, destination })
+      ...json(req)
     }),
   cancelDownload: (id: string) => request<void>(`/api/downloads/${id}/cancel`, { method: 'POST' }),
   removeDownload: (id: string) => request<void>(`/api/downloads/${id}`, { method: 'DELETE' }),
@@ -66,5 +86,7 @@ export const api = {
   syncCookies: () => request<CookieCloudStatus>('/api/cookiecloud/sync', { method: 'POST' }),
   listFiles: () => request<ArchiveFile[]>('/api/files'),
   deleteFile: (name: string) =>
-    request<void>(`/api/files/${encodeURIComponent(name)}`, { method: 'DELETE' })
+    request<void>(`/api/files/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  fetchDownloadFile: (id: string) => fetchBlob(`/api/downloads/${id}/file`),
+  fetchArchiveFile: (name: string) => fetchBlob(`/api/files/${encodeURIComponent(name)}`)
 }

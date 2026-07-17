@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '../api'
 import { getToken } from '../auth'
+import { saveBlob } from '../save'
 import type { Download } from '../types'
 
 export const useDownloadsStore = defineStore('downloads', () => {
@@ -16,13 +17,13 @@ export const useDownloadsStore = defineStore('downloads', () => {
   // without re-firing on every reconnect/refresh for already-seen items
   let lastStatus = new Map<string, string>()
 
-  function triggerBrowserSave(d: Download): void {
-    const a = document.createElement('a')
-    a.href = `/api/downloads/${d.id}/file`
-    a.download = d.filename ?? ''
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
+  async function triggerBrowserSave(d: Download): Promise<void> {
+    try {
+      const blob = await api.fetchDownloadFile(d.id)
+      saveBlob(blob, d.filename ?? '')
+    } catch (err) {
+      console.error('[downloads] direct save failed:', err)
+    }
   }
 
   function applyState(list: Download[]): void {
@@ -35,7 +36,7 @@ export const useDownloadsStore = defineStore('downloads', () => {
         d.destination === 'direct' &&
         !d.delivered
       ) {
-        triggerBrowserSave(d)
+        void triggerBrowserSave(d)
       }
     }
     lastStatus = new Map(list.map((d) => [d.id, d.status]))

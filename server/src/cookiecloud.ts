@@ -105,11 +105,37 @@ export function hasCookies(): boolean {
   return fs.existsSync(COOKIES_FILE)
 }
 
+function isConfigured(): boolean {
+  const { serverUrl, uuid, password } = getSettings().cookieCloud
+  return !!(serverUrl && uuid && password)
+}
+
+// Age after which cookies are considered stale when no auto-sync interval is set
+const DEFAULT_MAX_AGE_MIN = 30
+
+// Refreshes cookies before a download so the user doesn't have to sync manually.
+// Best-effort: on failure we fall back to whatever cookies already exist.
+export async function ensureFreshCookies(): Promise<void> {
+  if (!isConfigured()) return
+  const { autoSyncMinutes } = getSettings().cookieCloud
+  const maxAgeMs = (autoSyncMinutes > 0 ? autoSyncMinutes : DEFAULT_MAX_AGE_MIN) * 60_000
+  const fresh = status.lastSyncAt && hasCookies() && Date.now() - status.lastSyncAt < maxAgeMs
+  if (fresh) return
+  try {
+    await syncCookies()
+  } catch (err) {
+    console.error('[cookiecloud] pre-download sync failed:', (err as Error).message)
+  }
+}
+
 export function scheduleAutoSync(): void {
   if (syncTimer) clearInterval(syncTimer)
   syncTimer = null
-  const { autoSyncMinutes, serverUrl, uuid, password } = getSettings().cookieCloud
-  if (autoSyncMinutes > 0 && serverUrl && uuid && password) {
+  if (!isConfigured()) return
+  // Sync once now so cookies are current at boot and right after saving settings.
+  syncCookies().catch((err) => console.error('[cookiecloud] initial sync failed:', err.message))
+  const { autoSyncMinutes } = getSettings().cookieCloud
+  if (autoSyncMinutes > 0) {
     syncTimer = setInterval(() => {
       syncCookies().catch((err) => console.error('[cookiecloud] auto sync failed:', err.message))
     }, autoSyncMinutes * 60_000)

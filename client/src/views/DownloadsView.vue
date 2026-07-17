@@ -10,6 +10,9 @@ const url = ref('')
 const preset = ref('best')
 const playlist = ref(false)
 const destination = ref<'server' | 'direct'>('server')
+const container = ref('')
+const subtitles = ref(false)
+const subLangs = ref('zh-Hans')
 const presets = ref<string[]>(['best'])
 const submitting = ref(false)
 const error = ref<string | null>(null)
@@ -35,7 +38,15 @@ async function submit(): Promise<void> {
   submitting.value = true
   error.value = null
   try {
-    await api.addDownload(url.value.trim(), preset.value, playlist.value, destination.value)
+    await api.addDownload({
+      url: url.value.trim(),
+      preset: preset.value,
+      playlist: playlist.value,
+      destination: destination.value,
+      subtitles: subtitles.value,
+      subLangs: subtitles.value ? subLangs.value.trim() : undefined,
+      container: container.value || undefined
+    })
     url.value = ''
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
@@ -48,8 +59,9 @@ async function submit(): Promise<void> {
 <template>
   <div class="card mb-4">
     <div class="card-body">
-      <form class="row g-2 align-items-center" @submit.prevent="submit">
-        <div class="col-12 col-md">
+      <form class="d-flex flex-column gap-3" @submit.prevent="submit">
+        <div>
+          <label class="form-label">Video or playlist URL</label>
           <input
             v-model="url"
             class="form-control"
@@ -58,18 +70,33 @@ async function submit(): Promise<void> {
             required
           />
         </div>
-        <div class="col-auto">
-          <select v-model="preset" class="form-select">
-            <option v-for="p in presets" :key="p" :value="p">{{ p }}</option>
-          </select>
-        </div>
-        <div class="col-auto">
-          <div class="form-check">
-            <input id="playlist-check" v-model="playlist" class="form-check-input" type="checkbox" />
-            <label class="form-check-label" for="playlist-check">Playlist</label>
+
+        <div class="row g-3 align-items-end">
+          <div class="col-6 col-sm-auto">
+            <label class="form-label">Quality</label>
+            <select v-model="preset" class="form-select">
+              <option v-for="p in presets" :key="p" :value="p">{{ p }}</option>
+            </select>
+          </div>
+          <div class="col-6 col-sm-auto">
+            <label class="form-label">Format</label>
+            <select v-model="container" class="form-select">
+              <option value="">Auto</option>
+              <option value="mp4">mp4</option>
+              <option value="mkv">mkv</option>
+              <option value="webm">webm</option>
+            </select>
+          </div>
+          <div class="col-auto">
+            <div class="form-check pb-2">
+              <input id="playlist-check" v-model="playlist" class="form-check-input" type="checkbox" />
+              <label class="form-check-label" for="playlist-check">Playlist</label>
+            </div>
           </div>
         </div>
-        <div class="col-auto">
+
+        <div>
+          <label class="form-label d-block">Destination</label>
           <div class="btn-group" role="group">
             <button
               type="button"
@@ -89,7 +116,27 @@ async function submit(): Promise<void> {
             </button>
           </div>
         </div>
-        <div class="col-auto">
+
+        <div>
+          <div class="form-check">
+            <input id="subtitles-check" v-model="subtitles" class="form-check-input" type="checkbox" />
+            <label class="form-check-label" for="subtitles-check">Subtitles</label>
+          </div>
+          <template v-if="subtitles">
+            <input
+              v-model="subLangs"
+              class="form-control form-control-sm mt-2"
+              style="max-width: 16rem"
+              placeholder="Languages e.g. zh-Hans"
+            />
+            <small class="text-body-secondary d-block mt-1">
+              Comma-separated codes. Includes YouTube auto-generated / auto-translated captions.
+              Embedded as a selectable track; forces mp4 (or mkv) since webm can't carry it.
+            </small>
+          </template>
+        </div>
+
+        <div>
           <button class="btn btn-primary" type="submit" :disabled="submitting">Download</button>
         </div>
       </form>

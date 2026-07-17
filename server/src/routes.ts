@@ -2,7 +2,7 @@ import { Router } from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
 import { getSettings, updateSettings } from './config.js'
-import { getCookieCloudStatus, scheduleAutoSync, syncCookies } from './cookiecloud.js'
+import { ensureFreshCookies, getCookieCloudStatus, scheduleAutoSync, syncCookies } from './cookiecloud.js'
 import { manager, PRESETS } from './downloader.js'
 import type { NewDownloadRequest, Settings } from './types.js'
 
@@ -14,7 +14,7 @@ api.get('/downloads', (_req, res) => {
   res.json(manager.list())
 })
 
-api.post('/downloads', (req, res) => {
+api.post('/downloads', async (req, res) => {
   const body = req.body as NewDownloadRequest
   if (!body?.url || !/^https?:\/\//i.test(body.url)) {
     res.status(400).json({ error: 'A valid http(s) URL is required' })
@@ -24,6 +24,9 @@ api.post('/downloads', (req, res) => {
     res.status(400).json({ error: "destination must be 'server' or 'direct'" })
     return
   }
+  // Refresh CookieCloud cookies if stale so YouTube's bot check passes without
+  // the user having to sync manually first.
+  await ensureFreshCookies()
   res.status(201).json(manager.start(body))
 })
 

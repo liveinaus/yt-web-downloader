@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import ffmpegStatic from 'ffmpeg-static'
 import { COOKIES_FILE, DATA_DIR, getSettings } from './config.js'
 import { hasCookies } from './cookiecloud.js'
 import type { Download, NewDownloadRequest } from './types.js'
@@ -36,6 +37,56 @@ type ProgressLine = {
 function tokenise(input: string): string[] {
   const matches = input.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
   return matches.map((t) => t.replace(/^["']|["']$/g, ''))
+}
+
+const SUBTITLE_EXTS = new Set([
+  'vtt', 'srt', 'ass', 'ssa', 'lrc', 'ttml', 'srv1', 'srv2', 'srv3', 'json3', 'dfxp'
+])
+
+function isSubtitleFile(name?: string): boolean {
+  const ext = name?.split('.').pop()?.toLowerCase()
+  return !!ext && SUBTITLE_EXTS.has(ext)
+}
+
+// yt-dlp emits these once the media streams are downloaded and it begins
+// remuxing / converting / embedding: the real post-download work
+const POSTPROCESS_RE =
+  /^\[(Merger|ExtractAudio|VideoConvertor|VideoRemuxer|EmbedSubtitle|SubtitlesConvertor|Metadata|Fixup\w*)\]/
+
+const CONTAINERS = new Set(['mp4', 'mkv', 'webm'])
+
+// Builds the yt-dlp subtitle flags. Requests manual and auto-generated tracks
+// (the latter also covers YouTube's auto-translated captions) for the chosen
+// languages, then embeds them; mp3 and other audio containers can't carry a
+// subtitle track, so embedding is skipped for the audio preset. Fetching the
+// tracks leaves sidecar files behind, which removeSidecarSubs() cleans up once
+// the download finishes so an embedded download stays a single file.
+function subtitleArgs(req: NewDownloadRequest, preset: string): string[] {
+  if (!req.subtitles) return []
+  const langs = req.subLangs?.trim() || 'en'
+  const args = ['--write-subs', '--write-auto-subs', '--sub-langs', langs]
+  if (preset !== 'audio') args.push('--embed-subs')
+  return args
+}
+
+// Forces the output container. Subtitle embedding only works reliably in
+// mp4/mkv (webm silently drops the track), so an embed request upgrades any
+// webm/unset choice to mp4.
+function containerArgs(req: NewDownloadRequest, preset: string): string[] {
+  if (preset === 'audio') return []
+  let target = req.container && CONTAINERS.has(req.container) ? req.container : ''
+  if (req.subtitles && target !== 'mkv') target = 'mp4'
+  if (!target) return []
+  const args = ['--merge-output-format', target, '--remux-video', target]
+  // mp4 only plays cleanly with H.264 video + AAC audio. Left to its default,
+  // yt-dlp picks YouTube's best streams (VP9/AV1 + Opus); merge/remux only
+  // rewraps the container, never the codec, so the file opens nowhere (notably
+  // macOS/QuickTime). Sort to prefer H.264/AAC, matching yt-dlp's own "-t mp4"
+  // recipe. Only falls back to other codecs when no H.264 exists (e.g. 2160p).
+  if (target === 'mp4') {
+    args.push('-S', 'vcodec:h264,acodec:aac')
+  }
+  return args
 }
 
 class DownloadManager extends EventEmitter {
@@ -84,6 +135,12 @@ class DownloadManager extends EventEmitter {
 
     fs.mkdirSync(outDir, { recursive: true })
 
+    // yt-dlp needs ffmpeg to merge separate video/audio streams, convert audio
+    // and embed subtitles. Prefer a user-set path, else the bundled static build.
+    // ffmpeg-static's default export is the binary path; its typings mis-model it.
+    const bundledFfmpeg = ffmpegStatic as unknown as string | null
+    const ffmpegLocation = settings.ffmpegPath?.trim() || bundledFfmpeg
+
     const args = [
       req.url,
       '-P', outDir,
@@ -98,6 +155,9 @@ class DownloadManager extends EventEmitter {
       '--print', `before_dl:${TITLE_MARK}%(title)s`,
       '--print', `after_move:${PATH_MARK}%(filepath)s`,
       ...PRESETS[preset]!,
+      ...(ffmpegLocation ? ['--ffmpeg-location', ffmpegLocation] : []),
+      ...containerArgs(req, preset),
+      ...subtitleArgs(req, preset),
       ...(dl.playlist ? [] : ['--no-playlist']),
       ...(hasCookies() ? ['--cookies', COOKIES_FILE] : []),
       ...tokenise(settings.extraArgs)
@@ -119,12 +179,19 @@ class DownloadManager extends EventEmitter {
 
     let stderrTail = ''
     let stdoutBuf = ''
+    // Every final media file yt-dlp produces (one per video, more for a
+    // playlist); used to strip leftover subtitle sidecars once embedding is done
+    const finalPaths: string[] = []
 
     proc.stdout.on('data', (chunk: Buffer) => {
       stdoutBuf += chunk.toString()
       const lines = stdoutBuf.split('\n')
       stdoutBuf = lines.pop() ?? ''
-      for (const line of lines) this.handleLine(dl, line.trim())
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (trimmed.startsWith(PATH_MARK)) finalPaths.push(trimmed.slice(PATH_MARK.length))
+        this.handleLine(dl, trimmed)
+      }
     })
 
     proc.stderr.on('data', (chunk: Buffer) => {
@@ -147,6 +214,9 @@ class DownloadManager extends EventEmitter {
       if (code === 0) {
         dl.status = 'completed'
         dl.percent = 100
+        // Subtitles are embedded into the media; drop the sidecar files yt-dlp
+        // had to write to fetch them so the result is a single file
+        if (req.subtitles && preset !== 'audio') this.removeSidecarSubs(finalPaths)
       } else {
         dl.status = 'error'
         const errLine = stderrTail
@@ -211,6 +281,28 @@ class DownloadManager extends EventEmitter {
     this.emitUpdate()
   }
 
+  // Removes subtitle sidecars (e.g. "Title [id].zh-Hans.vtt") sitting next to a
+  // finished video, matching on the video's stem so unrelated files are left be
+  private removeSidecarSubs(videoPaths: string[]): void {
+    for (const vp of videoPaths) {
+      const dir = path.dirname(vp)
+      const base = path.basename(vp)
+      const stem = path.basename(vp, path.extname(vp))
+      let entries: string[]
+      try {
+        entries = fs.readdirSync(dir)
+      } catch {
+        continue
+      }
+      for (const name of entries) {
+        if (name === base) continue
+        if (name.startsWith(`${stem}.`) && isSubtitleFile(name)) {
+          fs.unlink(path.join(dir, name), () => {})
+        }
+      }
+    }
+  }
+
   private deleteDirectFile(dl: Download): void {
     if (dl.destination === 'direct' && dl.filepath) {
       fs.unlink(dl.filepath, () => {})
@@ -230,24 +322,37 @@ class DownloadManager extends EventEmitter {
       this.emitUpdate()
       return
     }
+    if (POSTPROCESS_RE.test(line)) {
+      dl.status = 'processing'
+      dl.percent = 100
+      dl.speed = null
+      dl.eta = null
+      this.emitUpdate()
+      return
+    }
     if (!line.startsWith('{')) return
     try {
       const p = JSON.parse(line) as ProgressLine
+      // A single download spans several files (separate video + audio streams,
+      // plus a file per subtitle track); each reports its own progress from zero.
+      // Auxiliary caption files must not touch the bar, and percent must never
+      // regress when yt-dlp moves on to the next stream.
       if (p.status === 'finished') {
-        // Download stream done; yt-dlp may still be merging or converting
-        dl.status = 'processing'
-        dl.percent = 100
+        // One file done; more streams may follow, so only clear the live stats.
         dl.speed = null
         dl.eta = null
-      } else if (p.status === 'downloading') {
+      } else if (p.status === 'downloading' && !isSubtitleFile(p.filename)) {
         dl.status = 'downloading'
         dl.downloadedBytes = p.downloaded_bytes ?? dl.downloadedBytes
         dl.totalBytes = p.total_bytes ?? p.total_bytes_estimate ?? dl.totalBytes
         dl.speed = p.speed ?? null
         dl.eta = p.eta ?? null
-        if (dl.totalBytes) dl.percent = Math.min(100, (dl.downloadedBytes / dl.totalBytes) * 100)
+        if (dl.totalBytes) {
+          const pct = Math.min(100, (dl.downloadedBytes / dl.totalBytes) * 100)
+          dl.percent = Math.max(dl.percent, pct)
+        }
+        if (p.filename && !dl.filename) dl.filename = path.basename(p.filename)
       }
-      if (p.filename && !dl.filename) dl.filename = path.basename(p.filename)
       this.emitUpdate()
     } catch {
       // Not a progress line, ignore

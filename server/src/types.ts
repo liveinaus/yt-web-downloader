@@ -46,6 +46,9 @@ export type CookieCloudStatus = {
 export type Settings = {
   downloadDir: string
   ytdlpPath: string
+  // Path to the ffmpeg binary (or its directory). Empty falls back to the
+  // static build bundled via the ffmpeg-static package.
+  ffmpegPath: string
   extraArgs: string
   cookieCloud: CookieCloudSettings
 }
@@ -55,4 +58,11 @@ export type NewDownloadRequest = {
   preset?: string
   playlist?: boolean
   destination?: Destination
+  // Fetch subtitles for the given comma-separated languages (e.g. "zh-Hans").
+  // Covers both OP-uploaded and YouTube auto-generated/auto-translated tracks.
+  subtitles?: boolean
+  subLangs?: string
+  // Output container to remux into (e.g. "mp4", "mkv", "webm"). Empty leaves
+  // yt-dlp's chosen container as-is.
+  container?: string
 }

@@ -23,7 +23,8 @@ const burnSubs = ref(prefs.burnSubs)
 const burnLang = ref(prefs.burnLang)
 const translateTitle = ref(prefs.translateTitle)
 const translateTo = ref(prefs.translateTo)
-const seqStart = ref('') // filename sequence prefix; kept as text so it can be empty
+// A number-type input, so v-model yields a number once filled and '' when empty
+const seqStart = ref<string | number>('')
 const presets = ref<string[]>(['best'])
 const submitting = ref(false)
 const error = ref<string | null>(null)
@@ -33,7 +34,7 @@ const quark = reactive({ loggedIn: false, folderId: '0', folderName: 'Root' })
 const folderPickerOpen = ref(false)
 
 const seqNumber = computed(() => {
-  const t = seqStart.value.trim()
+  const t = String(seqStart.value).trim()
   if (t === '') return null
   const n = Number(t)
   return Number.isFinite(n) ? n : NaN

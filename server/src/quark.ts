@@ -34,6 +34,29 @@ function mimeOf(name: string): string {
   return MIME[name.split('.').pop()?.toLowerCase() ?? ''] ?? 'application/octet-stream'
 }
 
+// fetch with a timeout, turning "host hangs / unreachable" into a clear error
+// instead of letting the request hang until an upstream proxy 502s. Quark's
+// endpoints are frequently unreachable from non-China networks.
+async function timedFetch(url: string | URL, init: RequestInit, timeoutMs = 15000): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) })
+  } catch (err) {
+    let host = 'Quark'
+    try {
+      host = new URL(url).host
+    } catch {
+      // keep default
+    }
+    if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      throw new Error(
+        `Timed out after ${timeoutMs / 1000}s reaching ${host}. This server likely cannot connect ` +
+          `to Quark (it is usually unreachable from non-China networks).`
+      )
+    }
+    throw new Error(`Could not connect to ${host}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
 type UpPreData = {
   task_id: string
   upload_id: string
@@ -98,7 +121,7 @@ export class QuarkClient {
     url.searchParams.set('pr', 'ucpro')
     url.searchParams.set('fr', 'pc')
     for (const [k, v] of Object.entries(opts.query ?? {})) url.searchParams.set(k, String(v))
-    const res = await fetch(url, {
+    const res = await timedFetch(url, {
       method,
       headers: {
         Cookie: this.cookie,
@@ -316,7 +339,7 @@ export class QuarkLogin {
     let current = url
     for (let hop = 0; hop < 5; hop++) {
       const cookie = this.cookieHeader()
-      const res = await fetch(current, {
+      const res = await timedFetch(current, {
         redirect: 'manual',
         headers: {
           'User-Agent': LOGIN_UA,

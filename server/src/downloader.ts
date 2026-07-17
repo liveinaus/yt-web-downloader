@@ -56,19 +56,21 @@ function isSubtitleFile(name?: string): boolean {
   return !!ext && SUBTITLE_EXTS.has(ext)
 }
 
-// Strips characters that are illegal in filenames and collapses whitespace
-function sanitizeName(s: string): string {
-  return s
-    .replace(/[\\/:*?"<>|\r\n]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
+// Splits a yt-dlp output stem "Title [id]" into title and bare id. The id is the
+// last bracketed group so titles containing brackets still work.
+function parseTitleId(stem: string): { title: string; id: string } {
+  const m = /^(.*) \[([^\]]+)\]$/.exec(stem)
+  return m ? { title: m[1]!, id: m[2]! } : { title: stem, id: '' }
 }
 
-// Splits a yt-dlp output stem "Title [id]" into its title and id-suffix parts.
-// The id is the last bracketed group so titles containing brackets still work.
-function splitStem(stem: string): { title: string; idSuffix: string } {
-  const m = /^(.*) (\[[^\]]+\])$/.exec(stem)
-  return m ? { title: m[1]!, idSuffix: ` ${m[2]!}` } : { title: stem, idSuffix: '' }
+// Filesystem-safe name: keep letters (including CJK) and digits, turn everything
+// else - whitespace, punctuation, brackets - into single underscores.
+function toUnderscoreName(s: string): string {
+  return s
+    .normalize('NFC')
+    .replace(/[^\p{L}\p{N}]+/gu, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
 }
 
 // yt-dlp emits these once the media streams are downloaded and it begins
@@ -261,9 +263,14 @@ class DownloadManager extends EventEmitter {
 
     let stderrTail = ''
     let stdoutBuf = ''
-    // Every final media file yt-dlp produces (one per video, more for a
-    // playlist); used to strip leftover subtitle sidecars once embedding is done
-    const finalPaths: string[] = []
+    // Post-process (rename -> subtitle -> upload) each item as soon as yt-dlp
+    // finishes it, so for a playlist the uploads overlap the remaining downloads.
+    // Items are chained so they process one at a time, but concurrently with the
+    // ongoing download.
+    let itemIndex = 0
+    let downloadActive = true
+    let postChain: Promise<void> = Promise.resolve()
+    const postErrors: string[] = []
 
     proc.stdout.on('data', (chunk: Buffer) => {
       stdoutBuf += chunk.toString()
@@ -271,7 +278,22 @@ class DownloadManager extends EventEmitter {
       stdoutBuf = lines.pop() ?? ''
       for (const line of lines) {
         const trimmed = line.trim()
-        if (trimmed.startsWith(PATH_MARK)) finalPaths.push(trimmed.slice(PATH_MARK.length))
+        if (trimmed.startsWith(PATH_MARK)) {
+          const itemPath = trimmed.slice(PATH_MARK.length)
+          const index = itemIndex++
+          postChain = postChain.then(() =>
+            this.postProcessItem(
+              dl,
+              req,
+              preset,
+              ffmpegLocation,
+              itemPath,
+              index,
+              () => downloadActive,
+              postErrors
+            )
+          )
+        }
         this.handleLine(dl, trimmed)
       }
     })
@@ -293,19 +315,33 @@ class DownloadManager extends EventEmitter {
     proc.on('close', (code) => {
       this.processes.delete(dl.id)
       if (dl.status === 'cancelled' || dl.status === 'error') return
+      downloadActive = false
+      // Reflect the tail of the pipeline still finishing after the last download
       if (code === 0) {
-        // Embedding runs after yt-dlp so we can add the bilingual track and pick
-        // the default; it repoints filepath at the muxed file when done.
-        void this.postProcess(dl, req, preset, finalPaths)
-      } else {
-        dl.status = 'error'
-        const errLine = stderrTail
-          .split('\n')
-          .reverse()
-          .find((l) => l.includes('ERROR'))
-        dl.error = errLine?.trim() ?? `yt-dlp exited with code ${code}`
-        this.finish(dl)
+        dl.status = dl.destination === 'quark' ? 'uploading' : 'processing'
+        this.emitUpdate()
       }
+      postChain
+        .catch((err) =>
+          console.error('[downloader] post-processing failed:', err instanceof Error ? err.message : err)
+        )
+        .then(() => {
+          if (code !== 0) {
+            dl.status = 'error'
+            const errLine = stderrTail
+              .split('\n')
+              .reverse()
+              .find((l) => l.includes('ERROR'))
+            dl.error = errLine?.trim() ?? `yt-dlp exited with code ${code}`
+          } else if (postErrors.length) {
+            dl.status = 'error'
+            dl.error = postErrors.join('; ')
+          } else {
+            dl.status = 'completed'
+            dl.percent = 100
+          }
+          this.finish(dl)
+        })
     })
 
     return dl
@@ -361,151 +397,125 @@ class DownloadManager extends EventEmitter {
     this.emitUpdate()
   }
 
-  // Runs after yt-dlp exits cleanly: embeds subtitle tracks (when requested) and
-  // then marks the download complete. Embedding failures are logged but never
-  // fail the download, and the fetched sidecars are left in place so the subs
-  // aren't lost.
-  private async postProcess(
+  // Processes one finished item: rename (sequence + translated title, always
+  // sanitised), embed/burn subtitles, then - for the quark destination - upload
+  // and delete locally. Runs while later playlist items are still downloading, so
+  // subtitle/upload failures are recorded but never abort the whole download.
+  private async postProcessItem(
     dl: Download,
     req: NewDownloadRequest,
     preset: string,
-    finalPaths: string[]
+    ffmpeg: string | null,
+    videoPath: string,
+    index: number,
+    isDownloadActive: () => boolean,
+    errors: string[]
   ): Promise<void> {
-    // Apply the sequence-number prefix / translated-title rename first, so the
-    // subsequent subtitle and upload steps see the final filenames
-    if (req.seqStart != null || req.translateTitle) {
-      dl.status = 'processing'
-      this.emitUpdate()
-      finalPaths = await this.renameOutputs(dl, req, finalPaths)
+    let current = videoPath
+    try {
+      current = await this.finalizeName(dl, req, current, index)
+    } catch (err) {
+      console.error('[downloader] rename failed:', err instanceof Error ? err.message : err)
     }
 
-    const ffmpeg = resolveFfmpeg()
     if (req.subtitles && preset !== 'audio' && ffmpeg) {
-      dl.status = 'processing'
-      dl.percent = 100
-      dl.speed = null
-      dl.eta = null
-      this.emitUpdate()
-      for (const videoPath of finalPaths) {
-        try {
-          if (req.burnSubs) await this.burnSubtitles(videoPath, req, ffmpeg)
-          else await this.embedTracks(videoPath, req, ffmpeg)
-        } catch (err) {
-          console.error(
-            '[downloader] subtitle post-processing failed:',
-            err instanceof Error ? err.message : err
-          )
-        }
+      try {
+        if (req.burnSubs) await this.burnSubtitles(current, req, ffmpeg)
+        else await this.embedTracks(current, req, ffmpeg)
+      } catch (err) {
+        console.error(
+          '[downloader] subtitle post-processing failed:',
+          err instanceof Error ? err.message : err
+        )
       }
     }
+
     if (dl.destination === 'quark') {
       try {
-        await this.uploadToQuark(dl, finalPaths)
+        await this.uploadOneToQuark(dl, current, isDownloadActive)
       } catch (err) {
-        dl.status = 'error'
-        dl.error = `Quark upload failed: ${err instanceof Error ? err.message : String(err)}`
-        // The local copies are ephemeral (kept only to upload); drop them so the
-        // quark temp dir doesn't accumulate failed downloads
-        for (const fp of finalPaths) fs.unlink(fp, () => {})
-        dl.filepath = null
-        this.finish(dl)
-        return
+        errors.push(err instanceof Error ? err.message : String(err))
+        // The local copy is ephemeral (kept only to upload); drop the failed one
+        fs.unlink(current, () => {})
       }
     }
-    dl.status = 'completed'
-    dl.percent = 100
-    this.finish(dl)
   }
 
-  // Renames each finished file (and its subtitle sidecars) to add a zero-padded
-  // sequence-number prefix and/or a translated-title prefix:
-  // "<seq> <translated title> <original title> [id].ext". Files are in playlist
-  // order, so the sequence increments per item. Returns the new video paths.
-  private async renameOutputs(
+  // Renames a finished file (and its subtitle sidecars) to the final filename:
+  // "<seq>_<translated title>_<original title>_<id>.ext", with all whitespace and
+  // special characters replaced by underscores. Returns the new path.
+  private async finalizeName(
     dl: Download,
     req: NewDownloadRequest,
-    paths: string[]
-  ): Promise<string[]> {
-    const seqStart = req.seqStart
-    const width = seqStart != null ? Math.max(2, String(seqStart + paths.length - 1).length) : 0
-    const out: string[] = []
-    for (let i = 0; i < paths.length; i++) {
-      const vp = paths[i]!
-      if (!fs.existsSync(vp)) {
-        out.push(vp)
-        continue
-      }
-      const dir = path.dirname(vp)
-      const ext = path.extname(vp)
-      const oldStem = path.basename(vp, ext)
-      const { title, idSuffix } = splitStem(oldStem)
+    videoPath: string,
+    index: number
+  ): Promise<string> {
+    if (!fs.existsSync(videoPath)) return videoPath
+    const dir = path.dirname(videoPath)
+    const ext = path.extname(videoPath)
+    const oldStem = path.basename(videoPath, ext)
+    const { title, id } = parseTitleId(oldStem)
 
-      const parts: string[] = []
-      if (seqStart != null) parts.push(String(seqStart + i).padStart(width, '0'))
-      if (req.translateTitle) {
-        try {
-          const translated = sanitizeName(await translateText(title, req.translateTo || 'zh-CN'))
-          if (translated && translated !== title) parts.push(translated)
-        } catch (err) {
-          console.error('[downloader] title translation failed:', err instanceof Error ? err.message : err)
-        }
-      }
-      parts.push(title)
-      const newStem = `${parts.join(' ')}${idSuffix}`
-      if (newStem === oldStem) {
-        out.push(vp)
-        continue
-      }
-
-      const newVp = path.join(dir, newStem + ext)
-      fs.renameSync(vp, newVp)
-      // Rename sidecars sharing the old stem (e.g. subtitle files) to match
+    const parts: string[] = []
+    if (req.seqStart != null) parts.push(String(req.seqStart + index).padStart(2, '0'))
+    if (req.translateTitle) {
       try {
-        for (const name of fs.readdirSync(dir)) {
-          if (name.startsWith(`${oldStem}.`)) {
-            fs.renameSync(path.join(dir, name), path.join(dir, newStem + name.slice(oldStem.length)))
-          }
-        }
-      } catch {
-        // best-effort sidecar rename
+        const translated = await translateText(title, req.translateTo || 'zh-CN')
+        if (translated) parts.push(translated)
+      } catch (err) {
+        console.error('[downloader] title translation failed:', err instanceof Error ? err.message : err)
       }
-      out.push(newVp)
     }
-    const last = out[out.length - 1]
-    if (last) {
-      dl.filepath = last
-      dl.filename = path.basename(last)
-      this.emitUpdate()
+    parts.push(title)
+    if (id) parts.push(id)
+
+    const newStem = toUnderscoreName(parts.join(' ')) || oldStem
+    if (newStem === oldStem) return videoPath
+
+    const newVp = path.join(dir, newStem + ext)
+    fs.renameSync(videoPath, newVp)
+    // Rename sidecars sharing the old stem (e.g. subtitle files) to match
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (name.startsWith(`${oldStem}.`)) {
+          fs.renameSync(path.join(dir, name), path.join(dir, newStem + name.slice(oldStem.length)))
+        }
+      }
+    } catch {
+      // best-effort sidecar rename
     }
-    return out
+    dl.filepath = newVp
+    dl.filename = path.basename(newVp)
+    this.emitUpdate()
+    return newVp
   }
 
-  // Uploads each finished file to Quark Drive, updating progress, then deletes
-  // the local copy so the server keeps no data. A rotated session cookie is
-  // persisted back to settings.
-  private async uploadToQuark(dl: Download, finalPaths: string[]): Promise<void> {
-    const { quark } = getSettings()
-    const cookie = quark.cookie?.trim()
+  // Uploads a single finished file to Quark Drive, then deletes the local copy.
+  // Upload progress is only shown once downloading is done, so it doesn't fight
+  // the download progress bar while a playlist is still in flight.
+  private async uploadOneToQuark(
+    dl: Download,
+    videoPath: string,
+    isDownloadActive: () => boolean
+  ): Promise<void> {
+    if (!fs.existsSync(videoPath)) return
+    const cookie = getSettings().quark.cookie?.trim()
     if (!cookie) throw new Error('Quark cookie is not set (add it in Settings)')
     const client = new QuarkClient(cookie, (updated) => {
       updateSettings({ quark: { ...getSettings().quark, cookie: updated } })
     })
-    dl.status = 'uploading'
-    dl.percent = 0
-    dl.speed = null
-    dl.eta = null
+    dl.filename = path.basename(videoPath)
     this.emitUpdate()
-    for (const fp of finalPaths) {
-      if (!fs.existsSync(fp)) continue
-      await client.uploadFile(fp, {
-        parentId: getSettings().quark.folderId || '0',
-        onProgress: (percent) => {
+    await client.uploadFile(videoPath, {
+      parentId: getSettings().quark.folderId || '0',
+      onProgress: (percent) => {
+        if (!isDownloadActive()) {
           dl.percent = percent
           this.emitUpdate()
         }
-      })
-      fs.unlink(fp, () => {})
-    }
+      }
+    })
+    fs.unlink(videoPath, () => {})
     dl.filepath = null
   }
 

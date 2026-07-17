@@ -1,24 +1,45 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '../api'
 import DownloadCard from '../components/DownloadCard.vue'
+import { loadPrefs, savePrefs } from '../prefs'
 import { useDownloadsStore } from '../stores/downloads'
 
 const store = useDownloadsStore()
 
+// Restore the last-used form choices; the URL is always left blank
+const prefs = loadPrefs()
 const url = ref('')
-const preset = ref('best')
-const playlist = ref(false)
-const destination = ref<'server' | 'direct'>('server')
-const container = ref('')
-const subtitles = ref(false)
-const subLang1 = ref('en')
-const subLang2 = ref('zh-Hans')
-const burnSubs = ref(false)
-const burnLang = ref('bilingual')
+const preset = ref(prefs.preset)
+const playlist = ref(prefs.playlist)
+const destination = ref<'server' | 'direct'>(prefs.destination)
+const container = ref(prefs.container)
+const subtitles = ref(prefs.subtitles)
+const subLang1 = ref(prefs.subLang1)
+const subLang2 = ref(prefs.subLang2)
+const burnSubs = ref(prefs.burnSubs)
+const burnLang = ref(prefs.burnLang)
 const presets = ref<string[]>(['best'])
 const submitting = ref(false)
 const error = ref<string | null>(null)
+
+// Persist choices whenever any of them change
+watch(
+  [preset, playlist, destination, container, subtitles, subLang1, subLang2, burnSubs, burnLang],
+  () => {
+    savePrefs({
+      preset: preset.value,
+      playlist: playlist.value,
+      destination: destination.value,
+      container: container.value,
+      subtitles: subtitles.value,
+      subLang1: subLang1.value,
+      subLang2: subLang2.value,
+      burnSubs: burnSubs.value,
+      burnLang: burnLang.value
+    })
+  }
+)
 
 const active = computed(() =>
   store.downloads.filter(

@@ -78,10 +78,15 @@ export const api = {
       method: 'POST',
       ...json(req)
     }),
+  retryDownload: (id: string) =>
+    request<Download>(`/api/downloads/${id}/retry`, { method: 'POST' }),
   cancelDownload: (id: string) => request<void>(`/api/downloads/${id}/cancel`, { method: 'POST' }),
   removeDownload: (id: string) => request<void>(`/api/downloads/${id}`, { method: 'DELETE' }),
   clearFinished: () => request<void>('/api/downloads/finished', { method: 'DELETE' }),
   getPresets: () => request<string[]>('/api/presets'),
+  getYtdlpVersion: () => request<{ version: string }>('/api/ytdlp/version'),
+  updateYtdlp: () =>
+    request<{ version: string; path: string }>('/api/ytdlp/update', { method: 'POST' }),
   getSettings: () =>
     request<{ settings: Settings; cookieCloud: CookieCloudStatus }>('/api/settings'),
   saveSettings: (settings: Settings) =>

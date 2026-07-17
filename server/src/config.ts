@@ -12,6 +12,7 @@ const defaults: Settings = {
   ytdlpPath: 'yt-dlp',
   ffmpegPath: '',
   extraArgs: '',
+  playlistSleep: 120,
   cookieCloud: {
     serverUrl: '',
     uuid: '',

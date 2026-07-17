@@ -30,6 +30,8 @@ export type Download = {
   delivered: boolean
   createdAt: number
   finishedAt: number | null
+  // The original request, kept so the job can be retried with the same options
+  request?: NewDownloadRequest
 }
 
 export type CookieCloudSettings = {
@@ -63,6 +65,9 @@ export type Settings = {
   // static build bundled via the ffmpeg-static package.
   ffmpegPath: string
   extraArgs: string
+  // Seconds to wait before each video in a playlist, to avoid YouTube's HTTP 429
+  // rate limiting. 0 disables the gap.
+  playlistSleep: number
   cookieCloud: CookieCloudSettings
   quark: QuarkSettings
 }

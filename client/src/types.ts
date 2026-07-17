@@ -28,6 +28,7 @@ export type Download = {
   delivered: boolean
   createdAt: number
   finishedAt: number | null
+  request?: NewDownloadRequest
 }
 
 export type NewDownloadRequest = {
@@ -76,6 +77,7 @@ export type Settings = {
   ytdlpPath: string
   ffmpegPath: string
   extraArgs: string
+  playlistSleep: number
   cookieCloud: CookieCloudSettings
   quark: QuarkSettings
 }

@@ -20,8 +20,42 @@ const DIRECT_DIR = path.join(DATA_DIR, 'direct')
 // Quark downloads are also ephemeral: fetched here, uploaded to Quark Drive,
 // then deleted so they use no server disk
 const QUARK_DIR = path.join(DATA_DIR, 'quark')
+// One yt-dlp download-archive per job; retries read it to skip finished items
+const ARCHIVES_DIR = path.join(DATA_DIR, 'archives')
 const TITLE_MARK = '__TITLE__'
 const PATH_MARK = '__PATH__'
+
+function archivePath(id: string): string {
+  return path.join(ARCHIVES_DIR, `${id}.txt`)
+}
+
+// Parses a PATH_MARK line "<mark><playlist_index>\t<filepath>" from yt-dlp's
+// after_move print. index is 0 for a non-playlist item.
+function parsePathMark(line: string): { index: number; path: string } {
+  const raw = line.slice(PATH_MARK.length)
+  const tab = raw.indexOf('\t')
+  if (tab === -1) return { index: 0, path: raw }
+  const idx = Number(raw.slice(0, tab))
+  return { index: Number.isFinite(idx) ? idx : 0, path: raw.slice(tab + 1) }
+}
+
+// Drops archive entries for the given video IDs so a retry re-fetches them.
+// Used for Quark, where yt-dlp records an item on download but the upload (our
+// step) may still have failed.
+function pruneArchive(file: string, ids: Set<string>): void {
+  try {
+    const kept = fs
+      .readFileSync(file, 'utf8')
+      .split('\n')
+      .filter((l) => {
+        const id = l.trim().split(/\s+/).pop()
+        return !(id && ids.has(id))
+      })
+    fs.writeFileSync(file, kept.join('\n'))
+  } catch {
+    // archive missing or unreadable -- nothing to prune
+  }
+}
 
 export const PRESETS: Record<string, string[]> = {
   best: [],
@@ -102,7 +136,12 @@ function subtitleArgs(req: NewDownloadRequest, preset: string): string[] {
     '--sub-langs',
     langs.join(','),
     '--convert-subs',
-    'vtt'
+    'vtt',
+    // Space out the several subtitle (timedtext) requests per video; YouTube
+    // rate-limits them hard from datacentre IPs and otherwise returns HTTP 429.
+    // Appended extraArgs win, so users can raise this if 429s persist.
+    '--sleep-requests',
+    '1'
   ]
 }
 
@@ -174,6 +213,54 @@ function findSidecar(dir: string, stem: string, code: string, entries: string[])
   )
 }
 
+// Runs a command capturing its output, resolving with the exit code and streams.
+function runCapture(cmd: string, args: string[]): Promise<{ code: number; out: string; err: string }> {
+  return new Promise((resolve, reject) => {
+    let proc: ChildProcessWithoutNullStreams
+    try {
+      proc = spawn(cmd, args)
+    } catch (e) {
+      reject(e instanceof Error ? e : new Error(String(e)))
+      return
+    }
+    let out = ''
+    let err = ''
+    proc.stdout.on('data', (d: Buffer) => (out += d.toString()))
+    proc.stderr.on('data', (d: Buffer) => (err += d.toString()))
+    proc.on('error', reject)
+    proc.on('close', (code) => resolve({ code: code ?? -1, out, err }))
+  })
+}
+
+// Returns the installed yt-dlp version string (e.g. "2025.01.15").
+export async function ytdlpVersion(): Promise<string> {
+  const { code, out, err } = await runCapture(getSettings().ytdlpPath, ['--version'])
+  if (code !== 0) throw new Error(err.trim() || `yt-dlp exited with code ${code}`)
+  return out.trim()
+}
+
+// Downloads the latest yt-dlp release into the data dir (writable by the app,
+// unlike /usr/local/bin) and points the configured path at it. Kept as the
+// release zipapp to match the container's python3 runtime. The download is
+// verified to run before the path is switched, so a bad fetch can't break
+// downloads. Returns the new version.
+export async function updateYtdlp(): Promise<{ version: string; path: string }> {
+  const dest = path.join(DATA_DIR, 'yt-dlp')
+  const tmp = `${dest}.download`
+  const res = await fetch('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp')
+  if (!res.ok) throw new Error(`Download failed with status ${res.status}`)
+  fs.writeFileSync(tmp, Buffer.from(await res.arrayBuffer()))
+  fs.chmodSync(tmp, 0o755)
+  const { code, out, err } = await runCapture(tmp, ['--version'])
+  if (code !== 0) {
+    fs.unlink(tmp, () => {})
+    throw new Error(err.trim() || `Downloaded yt-dlp failed to run (code ${code})`)
+  }
+  fs.renameSync(tmp, dest)
+  updateSettings({ ytdlpPath: dest })
+  return { version: out.trim(), path: dest }
+}
+
 class DownloadManager extends EventEmitter {
   private downloads = new Map<string, Download>()
   private processes = new Map<string, ChildProcessWithoutNullStreams>()
@@ -192,12 +279,9 @@ class DownloadManager extends EventEmitter {
   }
 
   start(req: NewDownloadRequest): Download {
-    const settings = getSettings()
     const preset = req.preset && req.preset in PRESETS ? req.preset : 'best'
     const destination =
       req.destination === 'direct' || req.destination === 'quark' ? req.destination : 'server'
-    const outDir =
-      destination === 'direct' ? DIRECT_DIR : destination === 'quark' ? QUARK_DIR : settings.downloadDir
     const dl: Download = {
       id: randomUUID(),
       url: req.url,
@@ -216,11 +300,55 @@ class DownloadManager extends EventEmitter {
       destination,
       delivered: false,
       createdAt: Date.now(),
-      finishedAt: null
+      finishedAt: null,
+      request: req
     }
     this.downloads.set(dl.id, dl)
+    this.launch(dl, req)
+    return dl
+  }
 
+  // Re-runs a failed/cancelled download with its original options. The job's
+  // download-archive is kept, so a playlist resumes from the items that didn't
+  // finish rather than re-fetching the whole list. Returns null when the job
+  // can't be retried (not found or still active).
+  retry(id: string): Download | null {
+    const dl = this.downloads.get(id)
+    if (!dl || (dl.status !== 'error' && dl.status !== 'cancelled')) return null
+    // Entries saved before requests were persisted lack dl.request; rebuild a
+    // minimal one from the record (loses subtitle/translate/sequence options).
+    const req: NewDownloadRequest = dl.request ?? {
+      url: dl.url,
+      preset: dl.preset,
+      playlist: dl.playlist,
+      destination: dl.destination
+    }
+    dl.request = req
+    dl.status = 'queued'
+    dl.percent = 0
+    dl.downloadedBytes = 0
+    dl.totalBytes = null
+    dl.speed = null
+    dl.eta = null
+    dl.error = null
+    dl.delivered = false
+    dl.finishedAt = null
+    this.launch(dl, req)
+    return dl
+  }
+
+  private launch(dl: Download, req: NewDownloadRequest): void {
+    const settings = getSettings()
+    const preset = dl.preset
+    const outDir =
+      dl.destination === 'direct'
+        ? DIRECT_DIR
+        : dl.destination === 'quark'
+          ? QUARK_DIR
+          : settings.downloadDir
     fs.mkdirSync(outDir, { recursive: true })
+    fs.mkdirSync(ARCHIVES_DIR, { recursive: true })
+    const archive = archivePath(dl.id)
 
     // yt-dlp needs ffmpeg to merge separate video/audio streams and convert audio
     const ffmpegLocation = resolveFfmpeg()
@@ -237,12 +365,21 @@ class DownloadManager extends EventEmitter {
       '--js-runtimes', 'node',
       '--progress-template', 'download:%(progress)j',
       '--print', `before_dl:${TITLE_MARK}%(title)s`,
-      '--print', `after_move:${PATH_MARK}%(filepath)s`,
+      // playlist_index numbers items by their true position, so a resumed
+      // playlist keeps correct sequence numbers even with items already done
+      '--print', `after_move:${PATH_MARK}%(playlist_index|0)s\t%(filepath)s`,
+      // Skip items already recorded as done, so a retry resumes from the failures
+      '--download-archive', archive,
       ...PRESETS[preset]!,
       ...(ffmpegLocation ? ['--ffmpeg-location', ffmpegLocation] : []),
       ...containerArgs(req, preset),
       ...subtitleArgs(req, preset),
       ...(dl.playlist ? [] : ['--no-playlist']),
+      // Pause before each video in a playlist to avoid YouTube's HTTP 429 rate
+      // limiting. Only meaningful for multi-video jobs.
+      ...(dl.playlist && settings.playlistSleep > 0
+        ? ['--sleep-interval', String(settings.playlistSleep)]
+        : []),
       ...(hasCookies() ? ['--cookies', COOKIES_FILE] : []),
       ...tokenise(settings.extraArgs)
     ]
@@ -254,7 +391,7 @@ class DownloadManager extends EventEmitter {
       dl.status = 'error'
       dl.error = err instanceof Error ? err.message : String(err)
       this.finish(dl)
-      return dl
+      return
     }
 
     this.processes.set(dl.id, proc)
@@ -267,10 +404,13 @@ class DownloadManager extends EventEmitter {
     // finishes it, so for a playlist the uploads overlap the remaining downloads.
     // Items are chained so they process one at a time, but concurrently with the
     // ongoing download.
-    let itemIndex = 0
     let downloadActive = true
     let postChain: Promise<void> = Promise.resolve()
     const postErrors: string[] = []
+    // For Quark, yt-dlp records an item as done once downloaded, before our
+    // upload runs. IDs whose upload fails are pruned from the archive after the
+    // run so a retry re-fetches and re-uploads them.
+    const failedUploadIds = new Set<string>()
 
     proc.stdout.on('data', (chunk: Buffer) => {
       stdoutBuf += chunk.toString()
@@ -279,8 +419,8 @@ class DownloadManager extends EventEmitter {
       for (const line of lines) {
         const trimmed = line.trim()
         if (trimmed.startsWith(PATH_MARK)) {
-          const itemPath = trimmed.slice(PATH_MARK.length)
-          const index = itemIndex++
+          const { index, path: itemPath } = parsePathMark(trimmed)
+          const seqOffset = dl.playlist && index >= 1 ? index - 1 : 0
           postChain = postChain.then(() =>
             this.postProcessItem(
               dl,
@@ -288,9 +428,10 @@ class DownloadManager extends EventEmitter {
               preset,
               ffmpegLocation,
               itemPath,
-              index,
+              seqOffset,
               () => downloadActive,
-              postErrors
+              postErrors,
+              failedUploadIds
             )
           )
         }
@@ -326,6 +467,9 @@ class DownloadManager extends EventEmitter {
           console.error('[downloader] post-processing failed:', err instanceof Error ? err.message : err)
         )
         .then(() => {
+          if (dl.destination === 'quark' && failedUploadIds.size) {
+            pruneArchive(archive, failedUploadIds)
+          }
           if (code !== 0) {
             dl.status = 'error'
             const errLine = stderrTail
@@ -343,8 +487,6 @@ class DownloadManager extends EventEmitter {
           this.finish(dl)
         })
     })
-
-    return dl
   }
 
   cancel(id: string): boolean {
@@ -368,6 +510,7 @@ class DownloadManager extends EventEmitter {
     if (!dl) return false
     if (this.processes.has(id)) this.cancel(id)
     this.deleteDirectFile(dl)
+    fs.unlink(archivePath(id), () => {})
     this.downloads.delete(id)
     this.saveHistory()
     this.emitUpdate()
@@ -378,6 +521,7 @@ class DownloadManager extends EventEmitter {
     for (const [id, dl] of this.downloads) {
       if (dl.status === 'completed' || dl.status === 'error' || dl.status === 'cancelled') {
         this.deleteDirectFile(dl)
+        fs.unlink(archivePath(id), () => {})
         this.downloads.delete(id)
       }
     }
@@ -409,8 +553,11 @@ class DownloadManager extends EventEmitter {
     videoPath: string,
     index: number,
     isDownloadActive: () => boolean,
-    errors: string[]
+    errors: string[],
+    failedUploadIds: Set<string>
   ): Promise<void> {
+    // Grab the id before finalizeName renames the file away from "Title [id]"
+    const { id } = parseTitleId(path.basename(videoPath, path.extname(videoPath)))
     let current = videoPath
     try {
       current = await this.finalizeName(dl, req, current, index)
@@ -435,6 +582,7 @@ class DownloadManager extends EventEmitter {
         await this.uploadOneToQuark(dl, current, isDownloadActive)
       } catch (err) {
         errors.push(err instanceof Error ? err.message : String(err))
+        if (id) failedUploadIds.add(id)
         // The local copy is ephemeral (kept only to upload); drop the failed one
         fs.unlink(current, () => {})
       }
@@ -714,8 +862,9 @@ class DownloadManager extends EventEmitter {
       return
     }
     if (line.startsWith(PATH_MARK)) {
-      dl.filepath = line.slice(PATH_MARK.length)
-      dl.filename = path.basename(dl.filepath)
+      const { path: fp } = parsePathMark(line)
+      dl.filepath = fp
+      dl.filename = path.basename(fp)
       this.emitUpdate()
       return
     }

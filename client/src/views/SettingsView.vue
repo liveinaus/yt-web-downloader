@@ -22,6 +22,9 @@ const accountForm = reactive({ username: '', currentPassword: '', newPassword: '
 const accountSaving = ref(false)
 const accountNotice = ref<{ kind: 'ok' | 'err'; text: string } | null>(null)
 
+const ytdlpVersion = ref<string | null>(null)
+const ytdlpUpdating = ref(false)
+
 onMounted(async () => {
   // Every other endpoint 403s until the forced password change is done, so
   // there's nothing to load yet -- the Account panel below still works
@@ -34,7 +37,34 @@ onMounted(async () => {
   } catch {
     // non-fatal; the client list just won't populate
   }
+  void loadYtdlpVersion()
 })
+
+async function loadYtdlpVersion(): Promise<void> {
+  try {
+    ytdlpVersion.value = (await api.getYtdlpVersion()).version
+  } catch {
+    ytdlpVersion.value = null
+  }
+}
+
+async function updateYtdlp(): Promise<void> {
+  ytdlpUpdating.value = true
+  notice.value = null
+  try {
+    const { version } = await api.updateYtdlp()
+    ytdlpVersion.value = version
+    // The update repoints ytdlpPath at the data-dir copy; pull it into the form
+    // so a later Save doesn't overwrite it with the old value
+    const data = await api.getSettings()
+    settings.value = data.settings
+    notice.value = { kind: 'ok', text: `yt-dlp updated to ${version}` }
+  } catch (err) {
+    notice.value = { kind: 'err', text: err instanceof Error ? err.message : String(err) }
+  } finally {
+    ytdlpUpdating.value = false
+  }
+}
 
 async function save(): Promise<void> {
   if (!settings.value) return
@@ -237,6 +267,22 @@ async function onFolderSelect(p: { folderId: string; folderName: string }): Prom
           <div class="col-md-6">
             <label class="form-label">yt-dlp path</label>
             <input v-model="settings.ytdlpPath" class="form-control" type="text" placeholder="yt-dlp" />
+            <div class="d-flex align-items-center gap-2 mt-2">
+              <button
+                class="btn btn-outline-secondary btn-sm"
+                :disabled="ytdlpUpdating"
+                @click="updateYtdlp"
+              >
+                {{ ytdlpUpdating ? 'Updating…' : 'Update yt-dlp' }}
+              </button>
+              <span class="form-text mb-0">
+                {{ ytdlpVersion ? `Version ${ytdlpVersion}` : 'Version unavailable' }}
+              </span>
+            </div>
+            <div class="form-text">
+              Downloads the latest release into the data folder. Fixes most "HTTP 403" download
+              errors.
+            </div>
           </div>
           <div class="col-md-6">
             <label class="form-label">ffmpeg path</label>
@@ -247,6 +293,16 @@ async function onFolderSelect(p: { folderId: string; folderName: string }): Prom
               placeholder="Bundled static build"
             />
             <div class="form-text">Leave blank to use the bundled ffmpeg.</div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Playlist gap (seconds between videos, 0 = off)</label>
+            <input
+              v-model.number="settings.playlistSleep"
+              class="form-control"
+              type="number"
+              min="0"
+            />
+            <div class="form-text">Slows playlist downloads to avoid YouTube's 429 rate limiting.</div>
           </div>
           <div class="col-12">
             <label class="form-label">Extra yt-dlp arguments</label>

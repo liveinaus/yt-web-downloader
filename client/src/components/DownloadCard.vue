@@ -20,6 +20,12 @@ const cancellable = computed(
   () => props.download.status === 'downloading' || props.download.status === 'queued'
 )
 
+// A failed/cancelled job can be retried. For a playlist the retry resumes from
+// the items that didn't finish.
+const retryable = computed(
+  () => props.download.status === 'error' || props.download.status === 'cancelled'
+)
+
 const destinationLabel = computed(() => {
   switch (props.download.destination) {
     case 'direct':
@@ -47,6 +53,10 @@ async function cancel(): Promise<void> {
 
 async function remove(): Promise<void> {
   await api.removeDownload(props.download.id)
+}
+
+async function retry(): Promise<void> {
+  await api.retryDownload(props.download.id)
 }
 </script>
 
@@ -84,6 +94,7 @@ async function remove(): Promise<void> {
       <div class="d-flex gap-2 mt-3">
         <button v-if="cancellable" class="btn btn-outline-danger btn-sm" @click="cancel">Cancel</button>
         <template v-if="!active">
+          <button v-if="retryable" class="btn btn-primary btn-sm" @click="retry">Retry</button>
           <a
             v-if="download.destination === 'direct' && download.status === 'completed' && !download.delivered"
             class="btn btn-primary btn-sm"

@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getSettings, updateSettings } from './config.js'
 import { ensureFreshCookies, getCookieCloudStatus, scheduleAutoSync, syncCookies } from './cookiecloud.js'
-import { manager, PRESETS } from './downloader.js'
+import { manager, PRESETS, updateYtdlp, ytdlpVersion } from './downloader.js'
 import { QUARK_CLIENTS, QuarkClient, QuarkLogin } from './quark.js'
 import type { NewDownloadRequest, Settings } from './types.js'
 
@@ -80,6 +80,18 @@ api.delete('/downloads/:id', (req, res) => {
   res.json({ ok: true })
 })
 
+api.post('/downloads/:id/retry', async (req, res) => {
+  // Refresh cookies first: a 403 is often a stale-cookie/bot check, so a retry
+  // benefits from the freshest cookies just like a new download
+  await ensureFreshCookies()
+  const dl = manager.retry(req.params.id)
+  if (!dl) {
+    res.status(409).json({ error: 'This download cannot be retried' })
+    return
+  }
+  res.status(201).json(dl)
+})
+
 api.post('/downloads/:id/cancel', (req, res) => {
   if (!manager.cancel(req.params.id)) {
     res.status(404).json({ error: 'Download not found' })
@@ -90,6 +102,22 @@ api.post('/downloads/:id/cancel', (req, res) => {
 
 api.get('/presets', (_req, res) => {
   res.json(Object.keys(PRESETS))
+})
+
+api.get('/ytdlp/version', async (_req, res) => {
+  try {
+    res.json({ version: await ytdlpVersion() })
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) })
+  }
+})
+
+api.post('/ytdlp/update', async (_req, res) => {
+  try {
+    res.json(await updateYtdlp())
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) })
+  }
 })
 
 // In-flight QR login sessions, keyed by the QR token. Expire after 5 minutes so

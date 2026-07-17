@@ -6,6 +6,7 @@ import type {
   NewDownloadRequest,
   QuarkClientOption,
   QuarkFolder,
+  QuarkStatus,
   Settings
 } from './types'
 
@@ -98,6 +99,11 @@ export const api = {
     ),
   listQuarkFolders: (parentId: string) =>
     request<QuarkFolder[]>(`/api/quark/folders?parentId=${encodeURIComponent(parentId)}`),
+  createQuarkFolder: (parentId: string, name: string) =>
+    request<{ ok: boolean }>('/api/quark/folders', { method: 'POST', ...json({ parentId, name }) }),
+  getQuarkStatus: () => request<QuarkStatus>('/api/quark/status'),
+  setQuarkTarget: (folderId: string, folderName: string) =>
+    request<{ ok: boolean }>('/api/quark/target', { method: 'PUT', ...json({ folderId, folderName }) }),
   listFiles: () => request<ArchiveFile[]>('/api/files'),
   deleteFile: (name: string) =>
     request<void>(`/api/files/${encodeURIComponent(name)}`, { method: 'DELETE' }),

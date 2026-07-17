@@ -30,6 +30,10 @@ api.post('/downloads', async (req, res) => {
     res.status(400).json({ error: "destination must be 'server', 'direct' or 'quark'" })
     return
   }
+  if (body.playlist && (body.seqStart == null || !Number.isFinite(body.seqStart))) {
+    res.status(400).json({ error: 'A start sequence number is required for playlists' })
+    return
+  }
   // Refresh CookieCloud cookies if stale so YouTube's bot check passes without
   // the user having to sync manually first.
   await ensureFreshCookies()
@@ -141,21 +145,59 @@ api.get('/quark/login/poll', async (req, res) => {
   }
 })
 
-api.get('/quark/folders', async (req, res) => {
+api.get('/quark/status', (_req, res) => {
+  const { cookie, folderId, folderName } = getSettings().quark
+  res.json({ loggedIn: !!cookie?.trim(), folderId, folderName })
+})
+
+// Builds a QuarkClient from the saved cookie, or returns null after replying 400
+function quarkClientOr400(res: import('express').Response): QuarkClient | null {
   const cookie = getSettings().quark.cookie?.trim()
   if (!cookie) {
     res.status(400).json({ error: 'Not logged in to Quark' })
-    return
+    return null
   }
+  return new QuarkClient(cookie, (updated) => {
+    updateSettings({ quark: { ...getSettings().quark, cookie: updated } })
+  })
+}
+
+api.get('/quark/folders', async (req, res) => {
+  const client = quarkClientOr400(res)
+  if (!client) return
   try {
-    const client = new QuarkClient(cookie, (updated) => {
-      updateSettings({ quark: { ...getSettings().quark, cookie: updated } })
-    })
-    const folders = await client.listFolders(String(req.query.parentId ?? '0'))
-    res.json(folders)
+    res.json(await client.listFolders(String(req.query.parentId ?? '0')))
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) })
   }
+})
+
+api.post('/quark/folders', async (req, res) => {
+  const { parentId, name } = (req.body ?? {}) as { parentId?: string; name?: string }
+  if (!name?.trim()) {
+    res.status(400).json({ error: 'Folder name is required' })
+    return
+  }
+  const client = quarkClientOr400(res)
+  if (!client) return
+  try {
+    await client.createFolder(parentId || '0', name.trim())
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) })
+  }
+})
+
+api.put('/quark/target', (req, res) => {
+  const { folderId, folderName } = (req.body ?? {}) as { folderId?: string; folderName?: string }
+  if (!folderId) {
+    res.status(400).json({ error: 'folderId is required' })
+    return
+  }
+  updateSettings({
+    quark: { ...getSettings().quark, folderId, folderName: folderName || 'Root' }
+  })
+  res.json({ ok: true })
 })
 
 api.get('/settings', (_req, res) => {

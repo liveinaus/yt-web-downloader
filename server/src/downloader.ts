@@ -9,6 +9,7 @@ import ffmpegStatic from 'ffmpeg-static'
 import { COOKIES_FILE, DATA_DIR, getSettings, updateSettings } from './config.js'
 import { hasCookies } from './cookiecloud.js'
 import { QuarkClient } from './quark.js'
+import { translateText } from './translate.js'
 import { langIso3, langName, mergeBilingual, parseVtt, toVtt } from './subtitles.js'
 import type { Download, NewDownloadRequest } from './types.js'
 
@@ -53,6 +54,21 @@ const SUBTITLE_EXTS = new Set([
 function isSubtitleFile(name?: string): boolean {
   const ext = name?.split('.').pop()?.toLowerCase()
   return !!ext && SUBTITLE_EXTS.has(ext)
+}
+
+// Strips characters that are illegal in filenames and collapses whitespace
+function sanitizeName(s: string): string {
+  return s
+    .replace(/[\\/:*?"<>|\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// Splits a yt-dlp output stem "Title [id]" into its title and id-suffix parts.
+// The id is the last bracketed group so titles containing brackets still work.
+function splitStem(stem: string): { title: string; idSuffix: string } {
+  const m = /^(.*) (\[[^\]]+\])$/.exec(stem)
+  return m ? { title: m[1]!, idSuffix: ` ${m[2]!}` } : { title: stem, idSuffix: '' }
 }
 
 // yt-dlp emits these once the media streams are downloaded and it begins
@@ -355,6 +371,14 @@ class DownloadManager extends EventEmitter {
     preset: string,
     finalPaths: string[]
   ): Promise<void> {
+    // Apply the sequence-number prefix / translated-title rename first, so the
+    // subsequent subtitle and upload steps see the final filenames
+    if (req.seqStart != null || req.translateTitle) {
+      dl.status = 'processing'
+      this.emitUpdate()
+      finalPaths = await this.renameOutputs(dl, req, finalPaths)
+    }
+
     const ffmpeg = resolveFfmpeg()
     if (req.subtitles && preset !== 'audio' && ffmpeg) {
       dl.status = 'processing'
@@ -391,6 +415,69 @@ class DownloadManager extends EventEmitter {
     dl.status = 'completed'
     dl.percent = 100
     this.finish(dl)
+  }
+
+  // Renames each finished file (and its subtitle sidecars) to add a zero-padded
+  // sequence-number prefix and/or a translated-title prefix:
+  // "<seq> <translated title> <original title> [id].ext". Files are in playlist
+  // order, so the sequence increments per item. Returns the new video paths.
+  private async renameOutputs(
+    dl: Download,
+    req: NewDownloadRequest,
+    paths: string[]
+  ): Promise<string[]> {
+    const seqStart = req.seqStart
+    const width = seqStart != null ? Math.max(2, String(seqStart + paths.length - 1).length) : 0
+    const out: string[] = []
+    for (let i = 0; i < paths.length; i++) {
+      const vp = paths[i]!
+      if (!fs.existsSync(vp)) {
+        out.push(vp)
+        continue
+      }
+      const dir = path.dirname(vp)
+      const ext = path.extname(vp)
+      const oldStem = path.basename(vp, ext)
+      const { title, idSuffix } = splitStem(oldStem)
+
+      const parts: string[] = []
+      if (seqStart != null) parts.push(String(seqStart + i).padStart(width, '0'))
+      if (req.translateTitle) {
+        try {
+          const translated = sanitizeName(await translateText(title, req.translateTo || 'zh-CN'))
+          if (translated && translated !== title) parts.push(translated)
+        } catch (err) {
+          console.error('[downloader] title translation failed:', err instanceof Error ? err.message : err)
+        }
+      }
+      parts.push(title)
+      const newStem = `${parts.join(' ')}${idSuffix}`
+      if (newStem === oldStem) {
+        out.push(vp)
+        continue
+      }
+
+      const newVp = path.join(dir, newStem + ext)
+      fs.renameSync(vp, newVp)
+      // Rename sidecars sharing the old stem (e.g. subtitle files) to match
+      try {
+        for (const name of fs.readdirSync(dir)) {
+          if (name.startsWith(`${oldStem}.`)) {
+            fs.renameSync(path.join(dir, name), path.join(dir, newStem + name.slice(oldStem.length)))
+          }
+        }
+      } catch {
+        // best-effort sidecar rename
+      }
+      out.push(newVp)
+    }
+    const last = out[out.length - 1]
+    if (last) {
+      dl.filepath = last
+      dl.filename = path.basename(last)
+      this.emitUpdate()
+    }
+    return out
   }
 
   // Uploads each finished file to Quark Drive, updating progress, then deletes

@@ -282,6 +282,16 @@ export class QuarkClient {
     }
     return folders
   }
+
+  // Creates a sub-folder under parentId ("0" = root) and returns nothing; the
+  // caller should re-list to pick up the new folder.
+  async createFolder(parentId: string, name: string): Promise<void> {
+    await this.call('/file', 'POST', {
+      body: { dir_init_lock: false, dir_path: '', file_name: name, pdir_fid: parentId }
+    })
+    // Quark registers the folder asynchronously; give it a moment
+    await new Promise((r) => setTimeout(r, 800))
+  }
 }
 
 export type QuarkLoginStatus = 'pending' | 'confirmed' | 'expired'

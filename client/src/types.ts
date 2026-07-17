@@ -41,6 +41,9 @@ export type NewDownloadRequest = {
   burnSubs?: boolean
   burnLang?: string
   container?: string
+  seqStart?: number
+  translateTitle?: boolean
+  translateTo?: string
 }
 
 export type CookieCloudSettings = {
@@ -66,6 +69,7 @@ export type QuarkSettings = {
 
 export type QuarkClientOption = { id: string; label: string }
 export type QuarkFolder = { fid: string; name: string }
+export type QuarkStatus = { loggedIn: boolean; folderId: string; folderName: string }
 
 export type Settings = {
   downloadDir: string

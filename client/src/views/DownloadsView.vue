@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import DownloadCard from '../components/DownloadCard.vue'
+import QuarkFolderPicker from '../components/QuarkFolderPicker.vue'
 import { loadPrefs, savePrefs } from '../prefs'
 import { useDownloadsStore } from '../stores/downloads'
 import type { Destination } from '../types'
@@ -20,13 +21,28 @@ const subLang1 = ref(prefs.subLang1)
 const subLang2 = ref(prefs.subLang2)
 const burnSubs = ref(prefs.burnSubs)
 const burnLang = ref(prefs.burnLang)
+const translateTitle = ref(prefs.translateTitle)
+const translateTo = ref(prefs.translateTo)
+const seqStart = ref('') // filename sequence prefix; kept as text so it can be empty
 const presets = ref<string[]>(['best'])
 const submitting = ref(false)
 const error = ref<string | null>(null)
 
+// Quark upload target, shown when "Save to Quark" is the destination
+const quark = reactive({ loggedIn: false, folderId: '0', folderName: 'Root' })
+const folderPickerOpen = ref(false)
+
+const seqNumber = computed(() => {
+  const t = seqStart.value.trim()
+  if (t === '') return null
+  const n = Number(t)
+  return Number.isFinite(n) ? n : NaN
+})
+const seqInvalid = computed(() => playlist.value && (seqNumber.value === null || Number.isNaN(seqNumber.value)))
+
 // Persist choices whenever any of them change
 watch(
-  [preset, playlist, destination, container, subtitles, subLang1, subLang2, burnSubs, burnLang],
+  [preset, playlist, destination, container, subtitles, subLang1, subLang2, burnSubs, burnLang, translateTitle, translateTo],
   () => {
     savePrefs({
       preset: preset.value,
@@ -37,10 +53,33 @@ watch(
       subLang1: subLang1.value,
       subLang2: subLang2.value,
       burnSubs: burnSubs.value,
-      burnLang: burnLang.value
+      burnLang: burnLang.value,
+      translateTitle: translateTitle.value,
+      translateTo: translateTo.value
     })
   }
 )
+
+async function loadQuarkStatus(): Promise<void> {
+  try {
+    const s = await api.getQuarkStatus()
+    quark.loggedIn = s.loggedIn
+    quark.folderId = s.folderId
+    quark.folderName = s.folderName
+  } catch {
+    // leave defaults; Settings will surface login problems
+  }
+}
+watch(destination, (d) => {
+  if (d === 'quark') void loadQuarkStatus()
+})
+
+async function onFolderSelect(p: { folderId: string; folderName: string }): Promise<void> {
+  await api.setQuarkTarget(p.folderId, p.folderName)
+  quark.folderId = p.folderId
+  quark.folderName = p.folderName
+  folderPickerOpen.value = false
+}
 
 const active = computed(() =>
   store.downloads.filter(
@@ -56,10 +95,15 @@ const finished = computed(() =>
 onMounted(async () => {
   store.refresh()
   presets.value = await api.getPresets()
+  if (destination.value === 'quark') void loadQuarkStatus()
 })
 
 async function submit(): Promise<void> {
   if (!url.value.trim()) return
+  if (seqInvalid.value) {
+    error.value = 'A start sequence number is required for playlists'
+    return
+  }
   submitting.value = true
   error.value = null
   try {
@@ -73,7 +117,10 @@ async function submit(): Promise<void> {
       subLang2: subtitles.value ? subLang2.value.trim() : undefined,
       burnSubs: subtitles.value ? burnSubs.value : undefined,
       burnLang: subtitles.value && burnSubs.value ? burnLang.value : undefined,
-      container: container.value || undefined
+      container: container.value || undefined,
+      seqStart: seqNumber.value !== null && !Number.isNaN(seqNumber.value) ? seqNumber.value : undefined,
+      translateTitle: translateTitle.value,
+      translateTo: translateTitle.value ? translateTo.value.trim() || 'zh-CN' : undefined
     })
     url.value = ''
   } catch (err) {
@@ -121,7 +168,22 @@ async function submit(): Promise<void> {
               <label class="form-check-label" for="playlist-check">Playlist</label>
             </div>
           </div>
+          <div class="col-6 col-sm-auto">
+            <label class="form-label">{{ playlist ? 'Start #' : 'Sequence #' }}</label>
+            <input
+              v-model="seqStart"
+              class="form-control"
+              :class="{ 'is-invalid': seqInvalid }"
+              type="number"
+              min="0"
+              style="max-width: 9rem"
+              :placeholder="playlist ? 'required' : 'optional'"
+            />
+          </div>
         </div>
+        <small class="text-body-secondary d-block" style="margin-top: -0.5rem">
+          Adds a zero-padded number prefix to the filename{{ playlist ? '; each playlist item increments from here' : '' }}.
+        </small>
 
         <div>
           <label class="form-label d-block">Destination</label>
@@ -151,10 +213,34 @@ async function submit(): Promise<void> {
               Save to Quark
             </button>
           </div>
-          <small v-if="destination === 'quark'" class="text-body-secondary d-block mt-1">
-            Downloads on the server, uploads to your Quark drive, then deletes the local copy.
-            Set your Quark cookie in Settings first.
-          </small>
+          <div v-if="destination === 'quark'" class="mt-2">
+            <small class="text-body-secondary d-block">
+              Downloads on the server, uploads to your Quark drive, then deletes the local copy.
+            </small>
+            <template v-if="quark.loggedIn">
+              <div class="d-flex align-items-center gap-2 flex-wrap mt-1">
+                <span class="small text-body-secondary">Upload to:</span>
+                <span class="badge text-bg-secondary">{{ quark.folderName || 'Root' }}</span>
+                <button
+                  type="button"
+                  class="btn btn-outline-secondary btn-sm"
+                  @click="folderPickerOpen = !folderPickerOpen"
+                >
+                  Change folder
+                </button>
+              </div>
+              <QuarkFolderPicker
+                v-if="folderPickerOpen"
+                class="mt-2"
+                style="max-width: 26rem"
+                @select="onFolderSelect"
+                @cancel="folderPickerOpen = false"
+              />
+            </template>
+            <small v-else class="text-danger d-block mt-1">
+              Not logged in to Quark. <RouterLink to="/settings">Log in in Settings</RouterLink> first.
+            </small>
+          </div>
         </div>
 
         <div>
@@ -202,7 +288,29 @@ async function submit(): Promise<void> {
         </div>
 
         <div>
-          <button class="btn btn-primary" type="submit" :disabled="submitting">Download</button>
+          <div class="form-check">
+            <input id="translate-check" v-model="translateTitle" class="form-check-input" type="checkbox" />
+            <label class="form-check-label" for="translate-check">Translate title in filename</label>
+          </div>
+          <template v-if="translateTitle">
+            <input
+              v-model="translateTo"
+              class="form-control form-control-sm mt-2"
+              style="max-width: 12rem"
+              placeholder="Target e.g. zh-CN"
+              aria-label="Translation target language"
+            />
+            <small class="text-body-secondary d-block mt-1">
+              Filename becomes “{prefix} {translated title} {original title} [id]”. Uses Google
+              Translate; falls back to the original title if it fails.
+            </small>
+          </template>
+        </div>
+
+        <div>
+          <button class="btn btn-primary" type="submit" :disabled="submitting || seqInvalid">
+            Download
+          </button>
         </div>
       </form>
       <div v-if="error" class="alert alert-danger mt-3 mb-0 py-2">{{ error }}</div>

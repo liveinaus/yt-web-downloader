@@ -88,4 +88,13 @@ export type NewDownloadRequest = {
   // Output container to remux into (e.g. "mp4", "mkv", "webm"). Empty leaves
   // yt-dlp's chosen container as-is.
   container?: string
+  // Prefix the output filename with a zero-padded sequence number. For a
+  // playlist this is the starting number and increments per item; required for
+  // playlists. Undefined = no prefix.
+  seqStart?: number
+  // Prepend a translated copy of the title to the filename:
+  // "<seq> <translated title> <original title> [id]".
+  translateTitle?: boolean
+  // Target language for the translated title (e.g. "zh-CN"). Defaults to zh-CN.
+  translateTo?: string
 }

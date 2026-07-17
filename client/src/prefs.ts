@@ -15,6 +15,8 @@ export type DownloadPrefs = {
   subLang2: string
   burnSubs: boolean
   burnLang: string
+  translateTitle: boolean
+  translateTo: string
 }
 
 export const defaultPrefs: DownloadPrefs = {
@@ -26,7 +28,9 @@ export const defaultPrefs: DownloadPrefs = {
   subLang1: 'en',
   subLang2: 'zh-Hans',
   burnSubs: false,
-  burnLang: 'bilingual'
+  burnLang: 'bilingual',
+  translateTitle: false,
+  translateTo: 'zh-CN'
 }
 
 export function loadPrefs(): DownloadPrefs {

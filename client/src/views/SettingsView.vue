@@ -6,7 +6,8 @@ import { api, authApi } from '../api'
 import { clearSession, requirePasswordChangeSignal, setSession } from '../auth'
 import { formatDate } from '../format'
 import { useDownloadsStore } from '../stores/downloads'
-import type { CookieCloudStatus, QuarkClientOption, QuarkFolder, Settings } from '../types'
+import QuarkFolderPicker from '../components/QuarkFolderPicker.vue'
+import type { CookieCloudStatus, QuarkClientOption, Settings } from '../types'
 
 const router = useRouter()
 const store = useDownloadsStore()
@@ -105,13 +106,7 @@ function logout(): void {
 const quarkClients = ref<QuarkClientOption[]>([])
 const quarkLoggedIn = computed(() => !!settings.value?.quark.cookie)
 const qr = reactive({ dataUrl: '', loading: false, error: '', status: '' as '' | 'waiting' | 'expired' })
-const folder = reactive({
-  open: false,
-  loading: false,
-  error: '',
-  list: [] as QuarkFolder[],
-  path: [] as QuarkFolder[]
-})
+const folderPickerOpen = ref(false)
 let qrToken = ''
 let qrTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -166,47 +161,18 @@ async function pollQuarkLogin(): Promise<void> {
   }
 }
 
-function currentFolder(): QuarkFolder {
-  return folder.path.length ? folder.path[folder.path.length - 1]! : { fid: '0', name: 'Root' }
-}
-
-async function loadFolders(parentId: string): Promise<void> {
-  folder.loading = true
-  folder.error = ''
-  try {
-    folder.list = await api.listQuarkFolders(parentId)
-  } catch (err) {
-    folder.error = err instanceof Error ? err.message : String(err)
-  } finally {
-    folder.loading = false
-  }
-}
-
 async function openFolderPicker(): Promise<void> {
   if (!settings.value) return
-  // Persist the current cookie first so the server can list on our behalf
+  // Persist the current cookie first so the server can browse on our behalf
   await save()
-  folder.open = true
-  folder.path = []
-  await loadFolders('0')
+  folderPickerOpen.value = true
 }
 
-function enterFolder(f: QuarkFolder): void {
-  folder.path.push(f)
-  void loadFolders(f.fid)
-}
-
-function breadcrumbTo(index: number): void {
-  folder.path = folder.path.slice(0, index + 1)
-  void loadFolders(index < 0 ? '0' : folder.path[index]!.fid)
-}
-
-async function useCurrentFolder(): Promise<void> {
+async function onFolderSelect(p: { folderId: string; folderName: string }): Promise<void> {
   if (!settings.value) return
-  const cur = currentFolder()
-  settings.value.quark.folderId = cur.fid
-  settings.value.quark.folderName = cur.name
-  folder.open = false
+  settings.value.quark.folderId = p.folderId
+  settings.value.quark.folderName = p.folderName
+  folderPickerOpen.value = false
   await save()
 }
 </script>
@@ -400,33 +366,12 @@ async function useCurrentFolder(): Promise<void> {
               Change folder
             </button>
           </div>
-
-          <div v-if="folder.open" class="border rounded p-2 mt-2">
-            <nav class="small mb-2">
-              <a href="#" @click.prevent="breadcrumbTo(-1)">Root</a>
-              <template v-for="(p, i) in folder.path" :key="p.fid">
-                / <a href="#" @click.prevent="breadcrumbTo(i)">{{ p.name }}</a>
-              </template>
-            </nav>
-            <div v-if="folder.loading" class="text-body-secondary small">Loading…</div>
-            <div v-else-if="folder.error" class="text-danger small">{{ folder.error }}</div>
-            <ul v-else class="list-unstyled mb-2" style="max-height: 12rem; overflow: auto">
-              <li v-for="f in folder.list" :key="f.fid">
-                <button class="btn btn-link btn-sm p-0 text-decoration-none" @click="enterFolder(f)">
-                  📁 {{ f.name }}
-                </button>
-              </li>
-              <li v-if="!folder.list.length" class="text-body-secondary small">No sub-folders here</li>
-            </ul>
-            <div class="d-flex gap-2">
-              <button class="btn btn-primary btn-sm" @click="useCurrentFolder">
-                Use “{{ currentFolder().name }}”
-              </button>
-              <button class="btn btn-outline-secondary btn-sm" @click="folder.open = false">
-                Cancel
-              </button>
-            </div>
-          </div>
+          <QuarkFolderPicker
+            v-if="folderPickerOpen"
+            class="mt-2"
+            @select="onFolderSelect"
+            @cancel="folderPickerOpen = false"
+          />
         </div>
 
         <details class="mt-3">

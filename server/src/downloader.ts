@@ -2,10 +2,13 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import ffmpegStatic from 'ffmpeg-static'
 import { COOKIES_FILE, DATA_DIR, getSettings } from './config.js'
 import { hasCookies } from './cookiecloud.js'
+import { langIso3, langName, mergeBilingual, parseVtt, toVtt } from './subtitles.js'
 import type { Download, NewDownloadRequest } from './types.js'
 
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json')
@@ -55,18 +58,30 @@ const POSTPROCESS_RE =
 
 const CONTAINERS = new Set(['mp4', 'mkv', 'webm'])
 
-// Builds the yt-dlp subtitle flags. Requests manual and auto-generated tracks
-// (the latter also covers YouTube's auto-translated captions) for the chosen
-// languages, then embeds them; mp3 and other audio containers can't carry a
-// subtitle track, so embedding is skipped for the audio preset. Fetching the
-// tracks leaves sidecar files behind, which removeSidecarSubs() cleans up once
-// the download finishes so an embedded download stays a single file.
+// The two subtitle languages to fetch, de-duplicated and trimmed. Empty entries
+// are dropped so a single-language request still works.
+function subLangs(req: NewDownloadRequest): string[] {
+  const raw = [req.subLang1, req.subLang2].map((l) => l?.trim()).filter((l): l is string => !!l)
+  return [...new Set(raw)]
+}
+
+// Builds the yt-dlp subtitle flags: download both languages' tracks (manual and
+// auto-generated, the latter also covering YouTube's auto-translated captions)
+// as VTT sidecars. Embedding is done afterwards by embedSubtitles() so we can
+// add the generated bilingual track and pick the default, so --embed-subs is
+// deliberately not used here.
 function subtitleArgs(req: NewDownloadRequest, preset: string): string[] {
   if (!req.subtitles) return []
-  const langs = req.subLangs?.trim() || 'en'
-  const args = ['--write-subs', '--write-auto-subs', '--sub-langs', langs]
-  if (preset !== 'audio') args.push('--embed-subs')
-  return args
+  const langs = subLangs(req)
+  if (!langs.length) return []
+  return [
+    '--write-subs',
+    '--write-auto-subs',
+    '--sub-langs',
+    langs.join(','),
+    '--convert-subs',
+    'vtt'
+  ]
 }
 
 // Forces the output container. Subtitle embedding only works reliably in
@@ -87,6 +102,54 @@ function containerArgs(req: NewDownloadRequest, preset: string): string[] {
     args.push('-S', 'vcodec:h264,acodec:aac')
   }
   return args
+}
+
+// Resolves the ffmpeg binary: a user-set path wins, else the bundled static
+// build. ffmpeg-static's default export is the binary path; its typings mis-model it.
+function resolveFfmpeg(): string | null {
+  const bundled = ffmpegStatic as unknown as string | null
+  return getSettings().ffmpegPath?.trim() || bundled
+}
+
+const SUB_CODEC: Record<string, string> = { mp4: 'mov_text', mkv: 'srt', webm: 'srt' }
+
+// Bundled CJK font for burn-in. libass otherwise renders Chinese/Japanese/Korean
+// as boxes since neither the base image nor most hosts ship a CJK font. Resolved
+// relative to this module so it works from both src (dev) and dist (prod).
+const FONTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'assets', 'fonts')
+const CJK_FONT_FILE = path.join(FONTS_DIR, 'NotoSansCJKsc-Regular.otf')
+const CJK_FONT_NAME = 'Noto Sans CJK SC'
+
+// Runs a child process to completion, resolving on exit 0 and rejecting with the
+// tail of stderr otherwise.
+function run(cmd: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args)
+    let err = ''
+    proc.stderr.on('data', (d: Buffer) => {
+      err = (err + d.toString()).slice(-2000)
+    })
+    proc.on('error', reject)
+    proc.on('close', (code) =>
+      code === 0 ? resolve() : reject(new Error(err.trim() || `exited with code ${code}`))
+    )
+  })
+}
+
+// Finds the VTT sidecar yt-dlp wrote for a language, e.g. "Title [id].zh-Hans.vtt".
+// Prefers an exact code match, then falls back to the base language (so "en"
+// still matches an "en-orig" file).
+function findSidecar(dir: string, stem: string, code: string, entries: string[]): string | null {
+  const prefix = `${stem}.`
+  const candidates = entries.filter((n) => n.startsWith(prefix) && n.toLowerCase().endsWith('.vtt'))
+  const langSeg = (n: string) => n.slice(prefix.length, n.length - 4).toLowerCase()
+  const want = code.toLowerCase()
+  const base = want.split('-')[0]!
+  return (
+    candidates.find((n) => langSeg(n) === want) ??
+    candidates.find((n) => langSeg(n).split('-')[0] === base) ??
+    null
+  )
 }
 
 class DownloadManager extends EventEmitter {
@@ -135,11 +198,8 @@ class DownloadManager extends EventEmitter {
 
     fs.mkdirSync(outDir, { recursive: true })
 
-    // yt-dlp needs ffmpeg to merge separate video/audio streams, convert audio
-    // and embed subtitles. Prefer a user-set path, else the bundled static build.
-    // ffmpeg-static's default export is the binary path; its typings mis-model it.
-    const bundledFfmpeg = ffmpegStatic as unknown as string | null
-    const ffmpegLocation = settings.ffmpegPath?.trim() || bundledFfmpeg
+    // yt-dlp needs ffmpeg to merge separate video/audio streams and convert audio
+    const ffmpegLocation = resolveFfmpeg()
 
     const args = [
       req.url,
@@ -212,11 +272,9 @@ class DownloadManager extends EventEmitter {
       this.processes.delete(dl.id)
       if (dl.status === 'cancelled' || dl.status === 'error') return
       if (code === 0) {
-        dl.status = 'completed'
-        dl.percent = 100
-        // Subtitles are embedded into the media; drop the sidecar files yt-dlp
-        // had to write to fetch them so the result is a single file
-        if (req.subtitles && preset !== 'audio') this.removeSidecarSubs(finalPaths)
+        // Embedding runs after yt-dlp so we can add the bilingual track and pick
+        // the default; it repoints filepath at the muxed file when done.
+        void this.postProcess(dl, req, preset, finalPaths)
       } else {
         dl.status = 'error'
         const errLine = stderrTail
@@ -224,8 +282,8 @@ class DownloadManager extends EventEmitter {
           .reverse()
           .find((l) => l.includes('ERROR'))
         dl.error = errLine?.trim() ?? `yt-dlp exited with code ${code}`
+        this.finish(dl)
       }
-      this.finish(dl)
     })
 
     return dl
@@ -279,6 +337,199 @@ class DownloadManager extends EventEmitter {
     dl.filepath = null
     this.saveHistory()
     this.emitUpdate()
+  }
+
+  // Runs after yt-dlp exits cleanly: embeds subtitle tracks (when requested) and
+  // then marks the download complete. Embedding failures are logged but never
+  // fail the download, and the fetched sidecars are left in place so the subs
+  // aren't lost.
+  private async postProcess(
+    dl: Download,
+    req: NewDownloadRequest,
+    preset: string,
+    finalPaths: string[]
+  ): Promise<void> {
+    const ffmpeg = resolveFfmpeg()
+    if (req.subtitles && preset !== 'audio' && ffmpeg) {
+      dl.status = 'processing'
+      dl.percent = 100
+      dl.speed = null
+      dl.eta = null
+      this.emitUpdate()
+      for (const videoPath of finalPaths) {
+        try {
+          if (req.burnSubs) await this.burnSubtitles(videoPath, req, ffmpeg)
+          else await this.embedTracks(videoPath, req, ffmpeg)
+        } catch (err) {
+          console.error(
+            '[downloader] subtitle post-processing failed:',
+            err instanceof Error ? err.message : err
+          )
+        }
+      }
+    }
+    dl.status = 'completed'
+    dl.percent = 100
+    this.finish(dl)
+  }
+
+  // Locates the video's downloaded subtitle sidecars, in request order (so
+  // subLang1 stays the primary/top language of the bilingual track).
+  private findTracks(
+    videoPath: string,
+    req: NewDownloadRequest
+  ): { dir: string; stem: string; ext: string; found: { code: string; file: string }[] } | null {
+    if (!fs.existsSync(videoPath)) return null
+    const dir = path.dirname(videoPath)
+    const ext = path.extname(videoPath).slice(1).toLowerCase()
+    const stem = path.basename(videoPath, path.extname(videoPath))
+    let entries: string[]
+    try {
+      entries = fs.readdirSync(dir)
+    } catch {
+      return null
+    }
+    const found = subLangs(req)
+      .map((code) => ({ code, file: findSidecar(dir, stem, code, entries) }))
+      .filter((l): l is { code: string; file: string } => !!l.file)
+    return { dir, stem, ext, found }
+  }
+
+  // Merges the first two found languages into a bilingual VTT string (primary on
+  // top). Returns null when fewer than two tracks exist or the merge is empty.
+  private buildBilingual(dir: string, found: { code: string; file: string }[]): string | null {
+    if (found.length < 2) return null
+    const [a, b] = found
+    const primary = parseVtt(fs.readFileSync(path.join(dir, a!.file), 'utf8'))
+    const secondary = parseVtt(fs.readFileSync(path.join(dir, b!.file), 'utf8'))
+    const merged = mergeBilingual(primary, secondary)
+    return merged.length ? toVtt(merged) : null
+  }
+
+  // Embeds the downloaded subtitle tracks into a finished video: each requested
+  // language, plus a generated bilingual track (set as the default) when both
+  // languages are present. Whatever's available is embedded; the sidecar files
+  // are removed afterwards so the result is a single file.
+  private async embedTracks(
+    videoPath: string,
+    req: NewDownloadRequest,
+    ffmpeg: string
+  ): Promise<void> {
+    const info = this.findTracks(videoPath, req)
+    if (!info) return
+    const { dir, stem, ext, found } = info
+    const codec = SUB_CODEC[ext]
+    if (!codec || !found.length) return // container can't carry subtitles
+
+    const tracks: { path: string; iso: string; title: string; default: boolean }[] = []
+
+    const bilingual = this.buildBilingual(dir, found)
+    if (bilingual) {
+      const biPath = path.join(dir, `${stem}.bilingual.vtt`)
+      fs.writeFileSync(biPath, bilingual)
+      tracks.push({
+        path: biPath,
+        iso: 'mul',
+        title: `${langName(found[0]!.code)} + ${langName(found[1]!.code)}`,
+        default: true
+      })
+    }
+
+    for (const l of found) {
+      tracks.push({
+        path: path.join(dir, l.file),
+        iso: langIso3(l.code),
+        title: langName(l.code),
+        // The first single-language track is the default only if no bilingual one exists
+        default: tracks.length === 0
+      })
+    }
+
+    const tmpPath = path.join(dir, `.${stem}.embed.${ext}`)
+    const args = ['-y', '-i', videoPath]
+    for (const t of tracks) args.push('-i', t.path)
+    args.push('-map', '0:v?', '-map', '0:a?')
+    tracks.forEach((_, i) => args.push('-map', String(i + 1)))
+    args.push('-c', 'copy', '-c:s', codec)
+    tracks.forEach((t, i) => {
+      args.push(`-metadata:s:s:${i}`, `language=${t.iso}`)
+      // title is what mkv and most players read; the mp4/mov muxer ignores it
+      // and shows handler_name instead, so set both for a labelled picker
+      args.push(`-metadata:s:s:${i}`, `title=${t.title}`)
+      args.push(`-metadata:s:s:${i}`, `handler_name=${t.title}`)
+      args.push(`-disposition:s:${i}`, t.default ? 'default' : '0')
+    })
+    if (ext === 'mp4') args.push('-movflags', '+faststart')
+    args.push(tmpPath)
+
+    await run(ffmpeg, args)
+    fs.renameSync(tmpPath, videoPath)
+    this.removeSidecarSubs([videoPath])
+  }
+
+  // Burns one subtitle track permanently into the picture (re-encoding the
+  // video) so it shows in any player. burnLang selects the track: "bilingual"
+  // (default) merges both languages, otherwise a specific language code is used;
+  // both fall back to whatever single track is available.
+  private async burnSubtitles(
+    videoPath: string,
+    req: NewDownloadRequest,
+    ffmpeg: string
+  ): Promise<void> {
+    const info = this.findTracks(videoPath, req)
+    if (!info || !info.found.length) return
+    const { dir, stem, ext, found } = info
+
+    const target = (req.burnLang || 'bilingual').toLowerCase()
+    let vtt: string | null = null
+    if (target !== 'bilingual') {
+      const match = found.find((l) => l.code.toLowerCase() === target)
+      if (match) vtt = fs.readFileSync(path.join(dir, match.file), 'utf8')
+    }
+    vtt ??= this.buildBilingual(dir, found)
+    vtt ??= fs.readFileSync(path.join(dir, found[0]!.file), 'utf8')
+
+    // Write to a temp path free of the characters the subtitles filter treats
+    // specially (colons, brackets, quotes) so no fragile escaping is needed
+    const burnPath = path.join(os.tmpdir(), `ytwd-burn-${randomUUID()}.vtt`)
+    fs.writeFileSync(burnPath, vtt)
+
+    // Point libass at the bundled CJK font so non-Latin subtitles render. The
+    // temp .vtt and fonts dir use clean paths, so no filter escaping is needed.
+    let filter = `subtitles=${burnPath}`
+    if (fs.existsSync(CJK_FONT_FILE)) {
+      filter += `:fontsdir=${FONTS_DIR}:force_style=FontName=${CJK_FONT_NAME}`
+    }
+
+    const tmpOut = path.join(dir, `.${stem}.burn.${ext}`)
+    const args = [
+      '-y',
+      '-i',
+      videoPath,
+      '-vf',
+      filter,
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '22',
+      '-c:a',
+      'copy'
+    ]
+    if (ext === 'mp4') args.push('-movflags', '+faststart')
+    args.push(tmpOut)
+
+    try {
+      await run(ffmpeg, args)
+      fs.renameSync(tmpOut, videoPath)
+    } catch (err) {
+      fs.unlink(tmpOut, () => {})
+      throw err
+    } finally {
+      fs.unlink(burnPath, () => {})
+    }
+    this.removeSidecarSubs([videoPath])
   }
 
   // Removes subtitle sidecars (e.g. "Title [id].zh-Hans.vtt") sitting next to a

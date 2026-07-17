@@ -35,7 +35,10 @@ export type NewDownloadRequest = {
   playlist: boolean
   destination: Destination
   subtitles?: boolean
-  subLangs?: string
+  subLang1?: string
+  subLang2?: string
+  burnSubs?: boolean
+  burnLang?: string
   container?: string
 }
 

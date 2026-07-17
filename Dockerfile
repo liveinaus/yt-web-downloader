@@ -30,6 +30,7 @@ COPY --from=builder /app/node_modules       ./node_modules
 COPY --from=builder /app/package.json       ./package.json
 COPY --from=builder /app/server/package.json ./server/package.json
 COPY --from=builder /app/server/dist        ./server/dist
+COPY --from=builder /app/server/assets      ./server/assets
 COPY --from=builder /app/client/dist        ./client/dist
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 

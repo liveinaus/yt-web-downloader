@@ -12,7 +12,10 @@ const playlist = ref(false)
 const destination = ref<'server' | 'direct'>('server')
 const container = ref('')
 const subtitles = ref(false)
-const subLangs = ref('zh-Hans')
+const subLang1 = ref('en')
+const subLang2 = ref('zh-Hans')
+const burnSubs = ref(false)
+const burnLang = ref('bilingual')
 const presets = ref<string[]>(['best'])
 const submitting = ref(false)
 const error = ref<string | null>(null)
@@ -44,7 +47,10 @@ async function submit(): Promise<void> {
       playlist: playlist.value,
       destination: destination.value,
       subtitles: subtitles.value,
-      subLangs: subtitles.value ? subLangs.value.trim() : undefined,
+      subLang1: subtitles.value ? subLang1.value.trim() : undefined,
+      subLang2: subtitles.value ? subLang2.value.trim() : undefined,
+      burnSubs: subtitles.value ? burnSubs.value : undefined,
+      burnLang: subtitles.value && burnSubs.value ? burnLang.value : undefined,
       container: container.value || undefined
     })
     url.value = ''
@@ -123,16 +129,41 @@ async function submit(): Promise<void> {
             <label class="form-check-label" for="subtitles-check">Subtitles</label>
           </div>
           <template v-if="subtitles">
-            <input
-              v-model="subLangs"
-              class="form-control form-control-sm mt-2"
-              style="max-width: 16rem"
-              placeholder="Languages e.g. zh-Hans"
-            />
+            <div class="d-flex gap-2 mt-2" style="max-width: 22rem">
+              <input
+                v-model="subLang1"
+                class="form-control form-control-sm"
+                placeholder="Language 1 e.g. en"
+                aria-label="First subtitle language"
+              />
+              <input
+                v-model="subLang2"
+                class="form-control form-control-sm"
+                placeholder="Language 2 e.g. zh-Hans"
+                aria-label="Second subtitle language"
+              />
+            </div>
             <small class="text-body-secondary d-block mt-1">
-              Comma-separated codes. Includes YouTube auto-generated / auto-translated captions.
-              Embedded as a selectable track; forces mp4 (or mkv) since webm can't carry it.
+              Both languages are embedded as selectable tracks, plus a combined bilingual track
+              (set as the default). Leave the second blank for a single language. Includes YouTube
+              auto-generated / auto-translated captions; forces mp4 (or mkv) since webm can't carry
+              subtitles.
             </small>
+            <div class="form-check mt-2">
+              <input id="burn-check" v-model="burnSubs" class="form-check-input" type="checkbox" />
+              <label class="form-check-label" for="burn-check">Burn subtitles into the video</label>
+            </div>
+            <template v-if="burnSubs">
+              <select v-model="burnLang" class="form-select form-select-sm mt-2" style="max-width: 16rem">
+                <option value="bilingual">Bilingual ({{ subLang1 }} + {{ subLang2 }})</option>
+                <option :value="subLang1">{{ subLang1 }}</option>
+                <option v-if="subLang2" :value="subLang2">{{ subLang2 }}</option>
+              </select>
+              <small class="text-body-secondary d-block mt-1">
+                Renders the chosen track permanently onto the picture so it shows in any player
+                (browsers, QuickTime). Re-encodes the video and is no longer selectable.
+              </small>
+            </template>
           </template>
         </div>
 

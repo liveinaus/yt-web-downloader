@@ -4,6 +4,8 @@ import type {
   CookieCloudStatus,
   Download,
   NewDownloadRequest,
+  QuarkClientOption,
+  QuarkFolder,
   Settings
 } from './types'
 
@@ -84,6 +86,18 @@ export const api = {
   saveSettings: (settings: Settings) =>
     request<Settings>('/api/settings', { method: 'PUT', ...json(settings) }),
   syncCookies: () => request<CookieCloudStatus>('/api/cookiecloud/sync', { method: 'POST' }),
+  getQuarkClients: () => request<QuarkClientOption[]>('/api/quark/clients'),
+  startQuarkLogin: (client: string) =>
+    request<{ token: string; qrUrl: string }>('/api/quark/login/start', {
+      method: 'POST',
+      ...json({ client })
+    }),
+  pollQuarkLogin: (token: string) =>
+    request<{ status: 'pending' | 'confirmed' | 'expired' }>(
+      `/api/quark/login/poll?token=${encodeURIComponent(token)}`
+    ),
+  listQuarkFolders: (parentId: string) =>
+    request<QuarkFolder[]>(`/api/quark/folders?parentId=${encodeURIComponent(parentId)}`),
   listFiles: () => request<ArchiveFile[]>('/api/files'),
   deleteFile: (name: string) =>
     request<void>(`/api/files/${encodeURIComponent(name)}`, { method: 'DELETE' }),

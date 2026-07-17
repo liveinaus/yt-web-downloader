@@ -10,13 +10,32 @@ const active = computed(
   () =>
     props.download.status === 'downloading' ||
     props.download.status === 'processing' ||
+    props.download.status === 'uploading' ||
     props.download.status === 'queued'
 )
+
+// Only an in-progress download or a queued one can be meaningfully cancelled;
+// post-processing/uploading can't be interrupted
+const cancellable = computed(
+  () => props.download.status === 'downloading' || props.download.status === 'queued'
+)
+
+const destinationLabel = computed(() => {
+  switch (props.download.destination) {
+    case 'direct':
+      return 'Direct to device'
+    case 'quark':
+      return 'Save to Quark'
+    default:
+      return 'Saved to server'
+  }
+})
 
 const statusBadge: Record<Download['status'], string> = {
   queued: 'text-bg-secondary',
   downloading: 'text-bg-warning',
   processing: 'text-bg-warning',
+  uploading: 'text-bg-info',
   completed: 'text-bg-success',
   error: 'text-bg-danger',
   cancelled: 'text-bg-danger'
@@ -40,13 +59,14 @@ async function remove(): Promise<void> {
       </div>
       <div class="text-body-secondary small d-flex flex-wrap gap-3 mt-1">
         <span v-if="download.filename">{{ download.filename }}</span>
-        <span v-if="active">
+        <span v-if="download.status === 'downloading'">
           {{ formatBytes(download.downloadedBytes) }} / {{ formatBytes(download.totalBytes) }}
         </span>
         <span v-if="download.status === 'downloading'">{{ formatSpeed(download.speed) }}</span>
         <span v-if="download.status === 'downloading'">ETA {{ formatEta(download.eta) }}</span>
+        <span v-if="download.status === 'uploading'">Uploading to Quark… {{ download.percent.toFixed(0) }}%</span>
         <span>{{ download.preset }}</span>
-        <span>{{ download.destination === 'direct' ? 'Direct to device' : 'Saved to server' }}</span>
+        <span>{{ destinationLabel }}</span>
       </div>
       <div v-if="active" class="progress mt-2" style="height: 6px">
         <div class="progress-bar" :style="{ width: `${download.percent.toFixed(1)}%` }" />
@@ -58,9 +78,12 @@ async function remove(): Promise<void> {
       <p v-if="download.destination === 'direct' && download.delivered" class="text-body-secondary small mb-0 mt-2">
         Saved to your device
       </p>
+      <p v-if="download.destination === 'quark' && download.status === 'completed'" class="text-body-secondary small mb-0 mt-2">
+        Uploaded to Quark
+      </p>
       <div class="d-flex gap-2 mt-3">
-        <button v-if="active" class="btn btn-outline-danger btn-sm" @click="cancel">Cancel</button>
-        <template v-else>
+        <button v-if="cancellable" class="btn btn-outline-danger btn-sm" @click="cancel">Cancel</button>
+        <template v-if="!active">
           <a
             v-if="download.destination === 'direct' && download.status === 'completed' && !download.delivered"
             class="btn btn-primary btn-sm"

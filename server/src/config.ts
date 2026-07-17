@@ -17,6 +17,12 @@ const defaults: Settings = {
     uuid: '',
     password: '',
     autoSyncMinutes: 0
+  },
+  quark: {
+    client: 'quark',
+    cookie: '',
+    folderId: '0',
+    folderName: 'Root'
   }
 }
 
@@ -29,10 +35,11 @@ function load(): Settings {
     return {
       ...defaults,
       ...raw,
-      cookieCloud: { ...defaults.cookieCloud, ...(raw.cookieCloud ?? {}) }
+      cookieCloud: { ...defaults.cookieCloud, ...(raw.cookieCloud ?? {}) },
+      quark: { ...defaults.quark, ...(raw.quark ?? {}) }
     }
   } catch {
-    return { ...defaults, cookieCloud: { ...defaults.cookieCloud } }
+    return { ...defaults, cookieCloud: { ...defaults.cookieCloud }, quark: { ...defaults.quark } }
   }
 }
 
@@ -44,7 +51,8 @@ export function updateSettings(patch: Partial<Settings>): Settings {
   settings = {
     ...settings,
     ...patch,
-    cookieCloud: { ...settings.cookieCloud, ...(patch.cookieCloud ?? {}) }
+    cookieCloud: { ...settings.cookieCloud, ...(patch.cookieCloud ?? {}) },
+    quark: { ...settings.quark, ...(patch.quark ?? {}) }
   }
   fs.mkdirSync(DATA_DIR, { recursive: true })
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(settings, null, 2))

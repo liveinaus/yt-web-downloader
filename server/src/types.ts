@@ -2,11 +2,14 @@ export type DownloadStatus =
   | 'queued'
   | 'downloading'
   | 'processing'
+  | 'uploading'
   | 'completed'
   | 'error'
   | 'cancelled'
 
-export type Destination = 'server' | 'direct'
+// 'quark' downloads to the server, uploads to Quark Drive, then deletes the
+// local copy so it uses no server disk
+export type Destination = 'server' | 'direct' | 'quark'
 
 export type Download = {
   id: string
@@ -43,6 +46,16 @@ export type CookieCloudStatus = {
   lastError: string | null
 }
 
+export type QuarkSettings = {
+  // Which Quark login client was used (see QUARK_CLIENTS)
+  client: string
+  // Session cookie, populated by QR login (or pasted manually)
+  cookie: string
+  // Destination folder in Quark ("0" is the drive root); folderName is for display
+  folderId: string
+  folderName: string
+}
+
 export type Settings = {
   downloadDir: string
   ytdlpPath: string
@@ -51,6 +64,7 @@ export type Settings = {
   ffmpegPath: string
   extraArgs: string
   cookieCloud: CookieCloudSettings
+  quark: QuarkSettings
 }
 
 export type NewDownloadRequest = {

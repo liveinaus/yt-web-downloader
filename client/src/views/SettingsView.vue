@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import QRCode from 'qrcode'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, authApi } from '../api'
 import { clearSession, requirePasswordChangeSignal, setSession } from '../auth'
 import { formatDate } from '../format'
 import { useDownloadsStore } from '../stores/downloads'
-import type { CookieCloudStatus, Settings } from '../types'
+import type { CookieCloudStatus, QuarkClientOption, QuarkFolder, Settings } from '../types'
 
 const router = useRouter()
 const store = useDownloadsStore()
@@ -27,6 +28,11 @@ onMounted(async () => {
   const data = await api.getSettings()
   settings.value = data.settings
   cookieStatus.value = data.cookieCloud
+  try {
+    quarkClients.value = await api.getQuarkClients()
+  } catch {
+    // non-fatal; the client list just won't populate
+  }
 })
 
 async function save(): Promise<void> {
@@ -93,6 +99,115 @@ async function updateAccount(): Promise<void> {
 function logout(): void {
   clearSession()
   router.push('/login')
+}
+
+// --- Quark: QR login + folder picker ---
+const quarkClients = ref<QuarkClientOption[]>([])
+const quarkLoggedIn = computed(() => !!settings.value?.quark.cookie)
+const qr = reactive({ dataUrl: '', loading: false, error: '', status: '' as '' | 'waiting' | 'expired' })
+const folder = reactive({
+  open: false,
+  loading: false,
+  error: '',
+  list: [] as QuarkFolder[],
+  path: [] as QuarkFolder[]
+})
+let qrToken = ''
+let qrTimer: ReturnType<typeof setTimeout> | null = null
+
+function stopQrPolling(): void {
+  if (qrTimer) {
+    clearTimeout(qrTimer)
+    qrTimer = null
+  }
+}
+onBeforeUnmount(stopQrPolling)
+
+async function startQuarkLogin(): Promise<void> {
+  if (!settings.value) return
+  stopQrPolling()
+  qr.error = ''
+  qr.status = 'waiting'
+  qr.loading = true
+  qr.dataUrl = ''
+  try {
+    const { token, qrUrl } = await api.startQuarkLogin(settings.value.quark.client || 'quark')
+    qrToken = token
+    qr.dataUrl = await QRCode.toDataURL(qrUrl, { width: 220, margin: 1 })
+    qrTimer = setTimeout(pollQuarkLogin, 2000)
+  } catch (err) {
+    qr.status = ''
+    qr.error = err instanceof Error ? err.message : String(err)
+  } finally {
+    qr.loading = false
+  }
+}
+
+async function pollQuarkLogin(): Promise<void> {
+  try {
+    const { status } = await api.pollQuarkLogin(qrToken)
+    if (status === 'confirmed') {
+      qr.status = ''
+      qr.dataUrl = ''
+      // Login saved the cookie server-side; pull it into the form so a later
+      // Save doesn't overwrite it with a stale value
+      const data = await api.getSettings()
+      if (settings.value) settings.value.quark = data.settings.quark
+      notice.value = { kind: 'ok', text: 'Logged in to Quark' }
+    } else if (status === 'expired') {
+      qr.status = 'expired'
+      qr.dataUrl = ''
+    } else {
+      qrTimer = setTimeout(pollQuarkLogin, 2000)
+    }
+  } catch (err) {
+    qr.status = ''
+    qr.error = err instanceof Error ? err.message : String(err)
+  }
+}
+
+function currentFolder(): QuarkFolder {
+  return folder.path.length ? folder.path[folder.path.length - 1]! : { fid: '0', name: 'Root' }
+}
+
+async function loadFolders(parentId: string): Promise<void> {
+  folder.loading = true
+  folder.error = ''
+  try {
+    folder.list = await api.listQuarkFolders(parentId)
+  } catch (err) {
+    folder.error = err instanceof Error ? err.message : String(err)
+  } finally {
+    folder.loading = false
+  }
+}
+
+async function openFolderPicker(): Promise<void> {
+  if (!settings.value) return
+  // Persist the current cookie first so the server can list on our behalf
+  await save()
+  folder.open = true
+  folder.path = []
+  await loadFolders('0')
+}
+
+function enterFolder(f: QuarkFolder): void {
+  folder.path.push(f)
+  void loadFolders(f.fid)
+}
+
+function breadcrumbTo(index: number): void {
+  folder.path = folder.path.slice(0, index + 1)
+  void loadFolders(index < 0 ? '0' : folder.path[index]!.fid)
+}
+
+async function useCurrentFolder(): Promise<void> {
+  if (!settings.value) return
+  const cur = currentFolder()
+  settings.value.quark.folderId = cur.fid
+  settings.value.quark.folderName = cur.name
+  folder.open = false
+  await save()
 }
 </script>
 
@@ -233,6 +348,103 @@ function logout(): void {
           <span v-else-if="cookieStatus?.lastError" class="form-text mb-0">
             Last attempt failed: {{ cookieStatus.lastError }}
           </span>
+        </div>
+      </div>
+    </div>
+
+    <h2 class="h5 mb-2">Quark Drive</h2>
+    <div class="card mb-4">
+      <div class="card-body">
+        <div class="row g-3 align-items-end">
+          <div class="col-md-4">
+            <label class="form-label">Client</label>
+            <select v-model="settings.quark.client" class="form-select">
+              <option v-for="c in quarkClients" :key="c.id" :value="c.id">{{ c.label }}</option>
+            </select>
+          </div>
+          <div class="col-md-8">
+            <div v-if="quarkLoggedIn" class="d-flex align-items-center gap-2">
+              <span class="badge text-bg-success">Logged in</span>
+              <button class="btn btn-outline-secondary btn-sm" :disabled="qr.loading" @click="startQuarkLogin">
+                Re-login
+              </button>
+            </div>
+            <button v-else class="btn btn-primary btn-sm" :disabled="qr.loading" @click="startQuarkLogin">
+              {{ qr.loading ? 'Preparing…' : 'Login with QR code' }}
+            </button>
+          </div>
+        </div>
+
+        <div v-if="qr.dataUrl || qr.status === 'expired' || qr.error" class="text-center mt-3">
+          <template v-if="qr.dataUrl">
+            <img
+              :src="qr.dataUrl"
+              alt="Quark login QR code"
+              width="220"
+              height="220"
+              class="border rounded bg-white p-2"
+            />
+            <div class="form-text">Open the Quark app, scan this code and confirm to log in.</div>
+          </template>
+          <div v-if="qr.status === 'expired'" class="text-danger small mt-2">
+            QR code expired. <a href="#" @click.prevent="startQuarkLogin">Get a new one</a>
+          </div>
+          <div v-if="qr.error" class="text-danger small mt-2">{{ qr.error }}</div>
+        </div>
+
+        <div v-if="quarkLoggedIn" class="mt-3">
+          <label class="form-label d-block">Upload folder</label>
+          <div class="d-flex align-items-center gap-2">
+            <span class="badge text-bg-secondary">{{ settings.quark.folderName || 'Root' }}</span>
+            <button class="btn btn-outline-secondary btn-sm" @click="openFolderPicker">
+              Change folder
+            </button>
+          </div>
+
+          <div v-if="folder.open" class="border rounded p-2 mt-2">
+            <nav class="small mb-2">
+              <a href="#" @click.prevent="breadcrumbTo(-1)">Root</a>
+              <template v-for="(p, i) in folder.path" :key="p.fid">
+                / <a href="#" @click.prevent="breadcrumbTo(i)">{{ p.name }}</a>
+              </template>
+            </nav>
+            <div v-if="folder.loading" class="text-body-secondary small">Loading…</div>
+            <div v-else-if="folder.error" class="text-danger small">{{ folder.error }}</div>
+            <ul v-else class="list-unstyled mb-2" style="max-height: 12rem; overflow: auto">
+              <li v-for="f in folder.list" :key="f.fid">
+                <button class="btn btn-link btn-sm p-0 text-decoration-none" @click="enterFolder(f)">
+                  📁 {{ f.name }}
+                </button>
+              </li>
+              <li v-if="!folder.list.length" class="text-body-secondary small">No sub-folders here</li>
+            </ul>
+            <div class="d-flex gap-2">
+              <button class="btn btn-primary btn-sm" @click="useCurrentFolder">
+                Use “{{ currentFolder().name }}”
+              </button>
+              <button class="btn btn-outline-secondary btn-sm" @click="folder.open = false">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <details class="mt-3">
+          <summary class="small text-body-secondary" style="cursor: pointer">
+            Advanced: paste cookie manually
+          </summary>
+          <textarea
+            v-model="settings.quark.cookie"
+            class="form-control font-monospace mt-2"
+            rows="3"
+            placeholder="Cookie from a logged-in pan.quark.cn session"
+          />
+        </details>
+
+        <div class="form-text mt-2">
+          Used by the "Save to Quark" download option: the file is fetched on the server, uploaded to
+          your Quark drive, then deleted locally. Quark has no official API, so the login can expire
+          and need refreshing.
         </div>
       </div>
     </div>

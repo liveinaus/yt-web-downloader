@@ -4,6 +4,7 @@ import { api } from '../api'
 import DownloadCard from '../components/DownloadCard.vue'
 import { loadPrefs, savePrefs } from '../prefs'
 import { useDownloadsStore } from '../stores/downloads'
+import type { Destination } from '../types'
 
 const store = useDownloadsStore()
 
@@ -12,7 +13,7 @@ const prefs = loadPrefs()
 const url = ref('')
 const preset = ref(prefs.preset)
 const playlist = ref(prefs.playlist)
-const destination = ref<'server' | 'direct'>(prefs.destination)
+const destination = ref<Destination>(prefs.destination)
 const container = ref(prefs.container)
 const subtitles = ref(prefs.subtitles)
 const subLang1 = ref(prefs.subLang1)
@@ -141,7 +142,19 @@ async function submit(): Promise<void> {
             >
               Direct to device
             </button>
+            <button
+              type="button"
+              class="btn btn-sm"
+              :class="destination === 'quark' ? 'btn-primary' : 'btn-outline-secondary'"
+              @click="destination = 'quark'"
+            >
+              Save to Quark
+            </button>
           </div>
+          <small v-if="destination === 'quark'" class="text-body-secondary d-block mt-1">
+            Downloads on the server, uploads to your Quark drive, then deletes the local copy.
+            Set your Quark cookie in Settings first.
+          </small>
         </div>
 
         <div>

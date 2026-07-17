@@ -2,11 +2,12 @@ export type DownloadStatus =
   | 'queued'
   | 'downloading'
   | 'processing'
+  | 'uploading'
   | 'completed'
   | 'error'
   | 'cancelled'
 
-export type Destination = 'server' | 'direct'
+export type Destination = 'server' | 'direct' | 'quark'
 
 export type Download = {
   id: string
@@ -56,12 +57,23 @@ export type CookieCloudStatus = {
   lastError: string | null
 }
 
+export type QuarkSettings = {
+  client: string
+  cookie: string
+  folderId: string
+  folderName: string
+}
+
+export type QuarkClientOption = { id: string; label: string }
+export type QuarkFolder = { fid: string; name: string }
+
 export type Settings = {
   downloadDir: string
   ytdlpPath: string
   ffmpegPath: string
   extraArgs: string
   cookieCloud: CookieCloudSettings
+  quark: QuarkSettings
 }
 
 export type ArchiveFile = {

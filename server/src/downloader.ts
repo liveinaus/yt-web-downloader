@@ -6,8 +6,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ffmpegStatic from 'ffmpeg-static'
-import { COOKIES_FILE, DATA_DIR, getSettings } from './config.js'
+import { COOKIES_FILE, DATA_DIR, getSettings, updateSettings } from './config.js'
 import { hasCookies } from './cookiecloud.js'
+import { QuarkClient } from './quark.js'
 import { langIso3, langName, mergeBilingual, parseVtt, toVtt } from './subtitles.js'
 import type { Download, NewDownloadRequest } from './types.js'
 
@@ -15,6 +16,9 @@ const HISTORY_FILE = path.join(DATA_DIR, 'history.json')
 // Direct downloads are ephemeral: streamed to the browser then deleted, so they
 // live outside settings.downloadDir and never show up in the Archive listing
 const DIRECT_DIR = path.join(DATA_DIR, 'direct')
+// Quark downloads are also ephemeral: fetched here, uploaded to Quark Drive,
+// then deleted so they use no server disk
+const QUARK_DIR = path.join(DATA_DIR, 'quark')
 const TITLE_MARK = '__TITLE__'
 const PATH_MARK = '__PATH__'
 
@@ -172,8 +176,10 @@ class DownloadManager extends EventEmitter {
   start(req: NewDownloadRequest): Download {
     const settings = getSettings()
     const preset = req.preset && req.preset in PRESETS ? req.preset : 'best'
-    const destination = req.destination === 'direct' ? 'direct' : 'server'
-    const outDir = destination === 'direct' ? DIRECT_DIR : settings.downloadDir
+    const destination =
+      req.destination === 'direct' || req.destination === 'quark' ? req.destination : 'server'
+    const outDir =
+      destination === 'direct' ? DIRECT_DIR : destination === 'quark' ? QUARK_DIR : settings.downloadDir
     const dl: Download = {
       id: randomUUID(),
       url: req.url,
@@ -368,9 +374,52 @@ class DownloadManager extends EventEmitter {
         }
       }
     }
+    if (dl.destination === 'quark') {
+      try {
+        await this.uploadToQuark(dl, finalPaths)
+      } catch (err) {
+        dl.status = 'error'
+        dl.error = `Quark upload failed: ${err instanceof Error ? err.message : String(err)}`
+        // The local copies are ephemeral (kept only to upload); drop them so the
+        // quark temp dir doesn't accumulate failed downloads
+        for (const fp of finalPaths) fs.unlink(fp, () => {})
+        dl.filepath = null
+        this.finish(dl)
+        return
+      }
+    }
     dl.status = 'completed'
     dl.percent = 100
     this.finish(dl)
+  }
+
+  // Uploads each finished file to Quark Drive, updating progress, then deletes
+  // the local copy so the server keeps no data. A rotated session cookie is
+  // persisted back to settings.
+  private async uploadToQuark(dl: Download, finalPaths: string[]): Promise<void> {
+    const { quark } = getSettings()
+    const cookie = quark.cookie?.trim()
+    if (!cookie) throw new Error('Quark cookie is not set (add it in Settings)')
+    const client = new QuarkClient(cookie, (updated) => {
+      updateSettings({ quark: { ...getSettings().quark, cookie: updated } })
+    })
+    dl.status = 'uploading'
+    dl.percent = 0
+    dl.speed = null
+    dl.eta = null
+    this.emitUpdate()
+    for (const fp of finalPaths) {
+      if (!fs.existsSync(fp)) continue
+      await client.uploadFile(fp, {
+        parentId: getSettings().quark.folderId || '0',
+        onProgress: (percent) => {
+          dl.percent = percent
+          this.emitUpdate()
+        }
+      })
+      fs.unlink(fp, () => {})
+    }
+    dl.filepath = null
   }
 
   // Locates the video's downloaded subtitle sidecars, in request order (so
@@ -627,7 +676,12 @@ class DownloadManager extends EventEmitter {
       const items = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')) as Download[]
       for (const item of items) {
         // Anything that was mid-flight when the server stopped is lost
-        if (item.status === 'downloading' || item.status === 'processing' || item.status === 'queued') {
+        if (
+          item.status === 'downloading' ||
+          item.status === 'processing' ||
+          item.status === 'uploading' ||
+          item.status === 'queued'
+        ) {
           item.status = 'error'
           item.error = 'Interrupted by server restart'
         }

@@ -4,6 +4,7 @@ import path from 'node:path'
 import { getSettings, updateSettings } from './config.js'
 import { ensureFreshCookies, getCookieCloudStatus, scheduleAutoSync, syncCookies } from './cookiecloud.js'
 import { manager, PRESETS } from './downloader.js'
+import { QUARK_CLIENTS, QuarkClient, QuarkLogin } from './quark.js'
 import type { NewDownloadRequest, Settings } from './types.js'
 
 // express.json() is applied once at the app level in index.ts, before this
@@ -20,8 +21,13 @@ api.post('/downloads', async (req, res) => {
     res.status(400).json({ error: 'A valid http(s) URL is required' })
     return
   }
-  if (body.destination && body.destination !== 'server' && body.destination !== 'direct') {
-    res.status(400).json({ error: "destination must be 'server' or 'direct'" })
+  if (
+    body.destination &&
+    body.destination !== 'server' &&
+    body.destination !== 'direct' &&
+    body.destination !== 'quark'
+  ) {
+    res.status(400).json({ error: "destination must be 'server', 'direct' or 'quark'" })
     return
   }
   // Refresh CookieCloud cookies if stale so YouTube's bot check passes without
@@ -80,6 +86,76 @@ api.post('/downloads/:id/cancel', (req, res) => {
 
 api.get('/presets', (_req, res) => {
   res.json(Object.keys(PRESETS))
+})
+
+// In-flight QR login sessions, keyed by the QR token. Expire after 5 minutes so
+// abandoned scans don't linger.
+const quarkLogins = new Map<string, QuarkLogin>()
+function pruneQuarkLogins(): void {
+  const cutoff = Date.now() - 5 * 60 * 1000
+  for (const [token, login] of quarkLogins) {
+    if (login.createdAt < cutoff) quarkLogins.delete(token)
+  }
+}
+
+api.get('/quark/clients', (_req, res) => {
+  res.json(Object.entries(QUARK_CLIENTS).map(([id, c]) => ({ id, label: c.label })))
+})
+
+api.post('/quark/login/start', async (req, res) => {
+  pruneQuarkLogins()
+  const client = (req.body as { client?: string })?.client ?? 'quark'
+  const conf = QUARK_CLIENTS[client]
+  if (!conf) {
+    res.status(400).json({ error: 'Unknown Quark client' })
+    return
+  }
+  try {
+    const login = new QuarkLogin(conf.clientId)
+    const { token, qrUrl } = await login.start()
+    quarkLogins.set(token, login)
+    res.json({ token, qrUrl })
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) })
+  }
+})
+
+api.get('/quark/login/poll', async (req, res) => {
+  const token = String(req.query.token ?? '')
+  const login = quarkLogins.get(token)
+  if (!login) {
+    res.status(404).json({ error: 'Login session not found or expired' })
+    return
+  }
+  try {
+    const result = await login.poll()
+    if (result.status === 'confirmed' && result.cookie) {
+      updateSettings({ quark: { ...getSettings().quark, cookie: result.cookie } })
+      quarkLogins.delete(token)
+    } else if (result.status === 'expired') {
+      quarkLogins.delete(token)
+    }
+    res.json({ status: result.status })
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) })
+  }
+})
+
+api.get('/quark/folders', async (req, res) => {
+  const cookie = getSettings().quark.cookie?.trim()
+  if (!cookie) {
+    res.status(400).json({ error: 'Not logged in to Quark' })
+    return
+  }
+  try {
+    const client = new QuarkClient(cookie, (updated) => {
+      updateSettings({ quark: { ...getSettings().quark, cookie: updated } })
+    })
+    const folders = await client.listFolders(String(req.query.parentId ?? '0'))
+    res.json(folders)
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) })
+  }
 })
 
 api.get('/settings', (_req, res) => {

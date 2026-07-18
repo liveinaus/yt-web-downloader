@@ -471,6 +471,14 @@ class DownloadManager extends EventEmitter {
     this.emitUpdate()
 
     void (async () => {
+      // Skip items whose file already exists at the destination (e.g. the same
+      // playlist re-added after a partial failure). Best-effort: any error just
+      // means no pre-seeded skips.
+      try {
+        await this.preseedArchive(dl, req, archive)
+      } catch (err) {
+        console.error('[downloader] existing-file check failed:', err instanceof Error ? err.message : err)
+      }
       let code = 0
       try {
         for (const args of passes) {
@@ -520,6 +528,69 @@ class DownloadManager extends EventEmitter {
           if (code !== 0) this.maybeAutoRetry(dl)
         })
     })()
+  }
+
+  // Pre-seeds the job's download-archive with items whose file already exists at
+  // the destination, so re-adding a URL skips videos downloaded by earlier jobs.
+  // Matching is by video id, which survives the rename: the final filename
+  // always ends with the sanitised id, whatever sequence/translation was used.
+  private async preseedArchive(
+    dl: Download,
+    req: NewDownloadRequest,
+    archive: string
+  ): Promise<void> {
+    // Direct downloads are deleted after delivery; there is nothing to compare
+    if (dl.destination === 'direct') return
+
+    const settings = getSettings()
+    let existing: string[]
+    if (dl.destination === 'quark') {
+      const cookie = settings.quark.cookie?.trim()
+      if (!cookie) return
+      const client = new QuarkClient(cookie, (updated) => {
+        updateSettings({ quark: { ...getSettings().quark, cookie: updated } })
+      })
+      existing = await client.listFiles(settings.quark.folderId || '0')
+    } else {
+      try {
+        existing = fs.readdirSync(settings.downloadDir)
+      } catch {
+        return
+      }
+    }
+    if (!existing.length) return
+
+    // Cheap metadata-only pass listing each item's extractor and id
+    const probe = await runCapture(settings.ytdlpPath, [
+      req.url,
+      '--flat-playlist',
+      '--print', '%(extractor_key)s\t%(id)s',
+      '--no-warnings',
+      ...(dl.playlist ? [] : ['--no-playlist']),
+      ...(hasCookies() ? ['--cookies', COOKIES_FILE] : [])
+    ])
+    if (probe.code !== 0) return
+
+    const entries: string[] = []
+    for (const line of probe.out.split('\n')) {
+      const [extractor, id] = line.trim().split('\t')
+      if (!extractor || !id) continue
+      const sanId = toUnderscoreName(id)
+      const hit = existing.some(
+        (n) =>
+          n.includes(`_${sanId}.`) || // renamed: "01_translated_title_id.mp4"
+          n.endsWith(`_${sanId}`) ||
+          n.includes(`[${id}]`) // un-renamed yt-dlp output: "Title [id].mp4"
+      )
+      // yt-dlp archive line format: "<extractor, lowercased> <video id>"
+      if (hit) entries.push(`${extractor.toLowerCase()} ${id}`)
+    }
+    if (entries.length) {
+      fs.appendFileSync(archive, entries.join('\n') + '\n')
+      console.log(
+        `[downloader] ${entries.length} item(s) already at destination; skipping (${dl.url})`
+      )
+    }
   }
 
   // Self-heals YouTube's "Sign in to confirm you're not a bot" failure: forces a

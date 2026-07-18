@@ -306,6 +306,29 @@ export class QuarkClient {
     return folders
   }
 
+  // Lists the file names in a Quark folder ("0" is the drive root), used to
+  // skip downloads whose upload already exists. All pages are fetched.
+  async listFiles(parentId = '0'): Promise<string[]> {
+    const names: string[] = []
+    const size = 100
+    let page = 1
+    for (;;) {
+      const resp = await this.call<SortResp>('/file/sort', 'GET', {
+        query: {
+          pdir_fid: parentId,
+          _size: size,
+          _page: page,
+          _fetch_total: 1,
+          _sort: 'file_type:asc,file_name:asc'
+        }
+      })
+      for (const f of resp.data.list) if (f.file) names.push(f.file_name)
+      if (page * size >= resp.metadata._total) break
+      page++
+    }
+    return names
+  }
+
   // Creates a sub-folder under parentId ("0" = root) and returns nothing; the
   // caller should re-list to pick up the new folder.
   async createFolder(parentId: string, name: string): Promise<void> {

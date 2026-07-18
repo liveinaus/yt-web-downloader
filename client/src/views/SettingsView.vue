@@ -139,6 +139,7 @@ const qr = reactive({ dataUrl: '', loading: false, error: '', status: '' as '' |
 const folderPickerOpen = ref(false)
 let qrToken = ''
 let qrTimer: ReturnType<typeof setTimeout> | null = null
+let qrPollFailures = 0
 
 function stopQrPolling(): void {
   if (qrTimer) {
@@ -155,6 +156,7 @@ async function startQuarkLogin(): Promise<void> {
   qr.status = 'waiting'
   qr.loading = true
   qr.dataUrl = ''
+  qrPollFailures = 0
   try {
     const { token, qrUrl } = await api.startQuarkLogin(settings.value.quark.client || 'quark')
     qrToken = token
@@ -171,6 +173,7 @@ async function startQuarkLogin(): Promise<void> {
 async function pollQuarkLogin(): Promise<void> {
   try {
     const { status } = await api.pollQuarkLogin(qrToken)
+    qrPollFailures = 0
     if (status === 'confirmed') {
       qr.status = ''
       qr.dataUrl = ''
@@ -186,6 +189,12 @@ async function pollQuarkLogin(): Promise<void> {
       qrTimer = setTimeout(pollQuarkLogin, 2000)
     }
   } catch (err) {
+    // A transient failure (proxy blip) shouldn't abort a login mid-scan; only
+    // give up after several consecutive failures
+    if (++qrPollFailures < 5) {
+      qrTimer = setTimeout(pollQuarkLogin, 2000)
+      return
+    }
     qr.status = ''
     qr.error = err instanceof Error ? err.message : String(err)
   }

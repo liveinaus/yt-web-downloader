@@ -43,7 +43,9 @@ app.use((_req, res, next) => {
   next()
 })
 
-app.get('/api/health', (_req, res) => res.json({ status: 'ok' }))
+app.get('/api/health', (_req, res) =>
+  res.json({ status: 'ok', version: process.env.APP_VERSION ?? 'dev' })
+)
 app.use('/api/auth', authRouter)
 app.use('/api', requireAuth, api)
 
@@ -55,6 +57,12 @@ if (fs.existsSync(clientDist)) {
 }
 
 const server = http.createServer(app)
+// Behind a reverse proxy (Cloudflare/nginx/Caddy), Node's default 5s keep-alive
+// races the proxy's connection reuse: the app closes an idle socket just as the
+// proxy sends the next request into it, which surfaces as sporadic bare 502s.
+// Keep sockets open longer than any common proxy idle timeout.
+server.keepAliveTimeout = 120_000
+server.headersTimeout = 125_000
 const wss = new WebSocketServer({ server, path: '/ws' })
 
 wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {

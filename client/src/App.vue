@@ -1,18 +1,26 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { api } from './api'
 import { isAuthenticated, requirePasswordChangeSignal } from './auth'
 import { theme, toggleTheme } from './theme'
 import { useDownloadsStore } from './stores/downloads'
 
 const store = useDownloadsStore()
 const route = useRoute()
+const version = ref('')
 
 // The server refuses the WebSocket (and every other route) until the forced
 // password change is done, so don't attempt it -- just wait for the signal
 // to clear, then connect once
 onMounted(() => {
   if (isAuthenticated() && !requirePasswordChangeSignal.value) store.connect()
+  api
+    .getHealth()
+    .then((h) => (version.value = h.version))
+    .catch(() => {
+      // non-fatal; the navbar just won't show a version
+    })
 })
 watch(requirePasswordChangeSignal, (stillRequired) => {
   if (isAuthenticated() && !stillRequired) store.connect()
@@ -27,7 +35,10 @@ onUnmounted(() => store.disconnect())
   <template v-else>
     <nav class="navbar navbar-expand-lg bg-body-tertiary border-bottom">
       <div class="container-fluid">
-        <RouterLink class="navbar-brand fw-bold" to="/">yt-web-downloader</RouterLink>
+        <RouterLink class="navbar-brand fw-bold" to="/">
+          yt-web-downloader
+          <span v-if="version" class="fw-normal small text-body-secondary ms-1">{{ version }}</span>
+        </RouterLink>
         <button
           class="navbar-toggler"
           type="button"

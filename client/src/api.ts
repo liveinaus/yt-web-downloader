@@ -72,6 +72,7 @@ export const authApi = {
 }
 
 export const api = {
+  getHealth: () => request<{ status: string; version: string }>('/api/health'),
   listDownloads: () => request<Download[]>('/api/downloads'),
   addDownload: (req: NewDownloadRequest) =>
     request<Download>('/api/downloads', {

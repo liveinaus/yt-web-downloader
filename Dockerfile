@@ -15,8 +15,13 @@ RUN npm run build && npm prune --omit=dev
 FROM node:22-alpine AS production
 WORKDIR /app
 
+# Build identifier shown in the UI, e.g. the git tag. Pass at build time:
+#   docker build --build-arg APP_VERSION=$(git describe --tags --always) ...
+ARG APP_VERSION=dev
+
 ENV NODE_ENV=production \
-    DATA_DIR=/app/data
+    DATA_DIR=/app/data \
+    APP_VERSION=$APP_VERSION
 
 # su-exec lets the entrypoint fix data-dir ownership as root, then drop to `node`
 # python3 runs the yt-dlp zipapp; ffmpeg is needed for merging/transcoding

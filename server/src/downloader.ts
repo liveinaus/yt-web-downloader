@@ -7,7 +7,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ffmpegStatic from 'ffmpeg-static'
 import { COOKIES_FILE, DATA_DIR, getSettings, updateSettings } from './config.js'
-import { hasCookies } from './cookiecloud.js'
+import { hasCookies, syncCookies } from './cookiecloud.js'
 import { QuarkClient } from './quark.js'
 import { translateText } from './translate.js'
 import { langIso3, langName, mergeBilingual, parseVtt, toVtt } from './subtitles.js'
@@ -24,6 +24,11 @@ const QUARK_DIR = path.join(DATA_DIR, 'quark')
 const ARCHIVES_DIR = path.join(DATA_DIR, 'archives')
 const TITLE_MARK = '__TITLE__'
 const PATH_MARK = '__PATH__'
+
+// YouTube's bot check: the session cookies are stale or rejected. Recoverable
+// by re-syncing from CookieCloud and retrying, which happens automatically.
+const BOT_CHECK_RE = /sign in to confirm|not a bot/i
+const MAX_AUTO_RETRIES = 2
 
 function archivePath(id: string): string {
   return path.join(ARCHIVES_DIR, `${id}.txt`)
@@ -312,9 +317,11 @@ class DownloadManager extends EventEmitter {
   // download-archive is kept, so a playlist resumes from the items that didn't
   // finish rather than re-fetching the whole list. Returns null when the job
   // can't be retried (not found or still active).
-  retry(id: string): Download | null {
+  retry(id: string, auto = false): Download | null {
     const dl = this.downloads.get(id)
     if (!dl || (dl.status !== 'error' && dl.status !== 'cancelled')) return null
+    // A manual retry starts a fresh auto-recovery budget
+    if (!auto) dl.autoRetries = 0
     // Entries saved before requests were persisted lack dl.request; rebuild a
     // minimal one from the record (loses subtitle/translate/sequence options).
     const req: NewDownloadRequest = dl.request ?? {
@@ -353,7 +360,7 @@ class DownloadManager extends EventEmitter {
     // yt-dlp needs ffmpeg to merge separate video/audio streams and convert audio
     const ffmpegLocation = resolveFfmpeg()
 
-    const args = [
+    const baseArgs = [
       req.url,
       '-P', outDir,
       '-o', '%(title)s [%(id)s].%(ext)s',
@@ -375,36 +382,32 @@ class DownloadManager extends EventEmitter {
       ...containerArgs(req, preset),
       ...subtitleArgs(req, preset),
       ...(dl.playlist ? [] : ['--no-playlist']),
-      // Pause before each video in a playlist to avoid YouTube's HTTP 429 rate
-      // limiting. Only meaningful for multi-video jobs.
-      ...(dl.playlist && settings.playlistSleep > 0
-        ? ['--sleep-interval', String(settings.playlistSleep)]
-        : []),
       ...(hasCookies() ? ['--cookies', COOKIES_FILE] : []),
       ...tokenise(settings.extraArgs)
     ]
 
-    let proc: ChildProcessWithoutNullStreams
-    try {
-      proc = spawn(settings.ytdlpPath, args, { detached: true })
-    } catch (err) {
-      dl.status = 'error'
-      dl.error = err instanceof Error ? err.message : String(err)
-      this.finish(dl)
-      return
-    }
+    // --sleep-interval also sleeps before the FIRST download, which would delay
+    // the job's start by the whole gap. So a playlist with a gap runs as two
+    // passes: item 1 immediately, then the rest with the gap. The shared archive
+    // makes pass 2 skip item 1 (archived items skip the sleep too, so retries
+    // stay fast).
+    const gap = dl.playlist ? settings.playlistSleep : 0
+    const passes: string[][] =
+      gap > 0
+        ? [
+            [...baseArgs, '--playlist-items', '1'],
+            [...baseArgs, '--sleep-interval', String(gap)]
+          ]
+        : [baseArgs]
 
-    this.processes.set(dl.id, proc)
-    dl.status = 'downloading'
-    this.emitUpdate()
-
+    // Shared across passes: post-processing chain, error collection and stderr
+    // tail all describe the one logical job.
     let stderrTail = ''
-    let stdoutBuf = ''
+    let downloadActive = true
     // Post-process (rename -> subtitle -> upload) each item as soon as yt-dlp
     // finishes it, so for a playlist the uploads overlap the remaining downloads.
     // Items are chained so they process one at a time, but concurrently with the
     // ongoing download.
-    let downloadActive = true
     let postChain: Promise<void> = Promise.resolve()
     const postErrors: string[] = []
     // For Quark, yt-dlp records an item as done once downloaded, before our
@@ -412,50 +415,79 @@ class DownloadManager extends EventEmitter {
     // run so a retry re-fetches and re-uploads them.
     const failedUploadIds = new Set<string>()
 
-    proc.stdout.on('data', (chunk: Buffer) => {
-      stdoutBuf += chunk.toString()
-      const lines = stdoutBuf.split('\n')
-      stdoutBuf = lines.pop() ?? ''
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (trimmed.startsWith(PATH_MARK)) {
-          const { index, path: itemPath } = parsePathMark(trimmed)
-          const seqOffset = dl.playlist && index >= 1 ? index - 1 : 0
-          postChain = postChain.then(() =>
-            this.postProcessItem(
-              dl,
-              req,
-              preset,
-              ffmpegLocation,
-              itemPath,
-              seqOffset,
-              () => downloadActive,
-              postErrors,
-              failedUploadIds
-            )
+    const handleStdoutLine = (trimmed: string): void => {
+      if (trimmed.startsWith(PATH_MARK)) {
+        const { index, path: itemPath } = parsePathMark(trimmed)
+        const seqOffset = dl.playlist && index >= 1 ? index - 1 : 0
+        postChain = postChain.then(() =>
+          this.postProcessItem(
+            dl,
+            req,
+            preset,
+            ffmpegLocation,
+            itemPath,
+            seqOffset,
+            () => downloadActive,
+            postErrors,
+            failedUploadIds
           )
-        }
-        this.handleLine(dl, trimmed)
+        )
       }
-    })
+      this.handleLine(dl, trimmed)
+    }
 
-    proc.stderr.on('data', (chunk: Buffer) => {
-      stderrTail = (stderrTail + chunk.toString()).slice(-4000)
-    })
+    // Runs one yt-dlp pass, resolving with its exit code (rejects on spawn errors)
+    const runPass = (args: string[]): Promise<number> =>
+      new Promise((resolve, reject) => {
+        let proc: ChildProcessWithoutNullStreams
+        try {
+          proc = spawn(settings.ytdlpPath, args, { detached: true })
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)))
+          return
+        }
+        this.processes.set(dl.id, proc)
+        let stdoutBuf = ''
+        proc.stdout.on('data', (chunk: Buffer) => {
+          stdoutBuf += chunk.toString()
+          const lines = stdoutBuf.split('\n')
+          stdoutBuf = lines.pop() ?? ''
+          for (const line of lines) handleStdoutLine(line.trim())
+        })
+        proc.stderr.on('data', (chunk: Buffer) => {
+          stderrTail = (stderrTail + chunk.toString()).slice(-4000)
+        })
+        proc.on('error', (err) => {
+          this.processes.delete(dl.id)
+          reject(err)
+        })
+        proc.on('close', (code) => {
+          this.processes.delete(dl.id)
+          resolve(code ?? -1)
+        })
+      })
 
-    proc.on('error', (err) => {
-      dl.status = 'error'
-      dl.error =
-        err.message.includes('ENOENT')
+    dl.status = 'downloading'
+    this.emitUpdate()
+
+    void (async () => {
+      let code = 0
+      try {
+        for (const args of passes) {
+          code = await runPass(args)
+          // cancel() already finished the record; don't overwrite its state
+          if (dl.status === 'cancelled' || dl.status === 'error') return
+          if (code !== 0) break
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        dl.status = 'error'
+        dl.error = message.includes('ENOENT')
           ? `yt-dlp binary not found at '${settings.ytdlpPath}'. Install yt-dlp or set its path in Settings.`
-          : err.message
-      this.processes.delete(dl.id)
-      this.finish(dl)
-    })
-
-    proc.on('close', (code) => {
-      this.processes.delete(dl.id)
-      if (dl.status === 'cancelled' || dl.status === 'error') return
+          : message
+        this.finish(dl)
+        return
+      }
       downloadActive = false
       // Reflect the tail of the pipeline still finishing after the last download
       if (code === 0) {
@@ -485,8 +517,32 @@ class DownloadManager extends EventEmitter {
             dl.percent = 100
           }
           this.finish(dl)
+          if (code !== 0) this.maybeAutoRetry(dl)
         })
-    })
+    })()
+  }
+
+  // Self-heals YouTube's "Sign in to confirm you're not a bot" failure: forces a
+  // CookieCloud sync (the scheduled freshness window doesn't apply -- the cookies
+  // were just rejected) and restarts the job, at most MAX_AUTO_RETRIES times per
+  // user action so a genuinely dead login can't retry forever.
+  private maybeAutoRetry(dl: Download): void {
+    if (dl.status !== 'error' || !dl.error || !BOT_CHECK_RE.test(dl.error)) return
+    const attempts = dl.autoRetries ?? 0
+    if (attempts >= MAX_AUTO_RETRIES) return
+    dl.autoRetries = attempts + 1
+    console.log(
+      `[downloader] bot check hit; syncing cookies and retrying (attempt ${dl.autoRetries}/${MAX_AUTO_RETRIES})`
+    )
+    void syncCookies()
+      .catch((err) =>
+        // Retry with the existing cookies anyway; the sync failing shouldn't
+        // strand a job that might still succeed
+        console.error('[downloader] auto-retry cookie sync failed:', (err as Error).message)
+      )
+      .then(() => {
+        this.retry(dl.id, true)
+      })
   }
 
   cancel(id: string): boolean {

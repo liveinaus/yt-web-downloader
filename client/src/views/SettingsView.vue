@@ -302,7 +302,10 @@ async function onFolderSelect(p: { folderId: string; folderName: string }): Prom
               type="number"
               min="0"
             />
-            <div class="form-text">Slows playlist downloads to avoid YouTube's 429 rate limiting.</div>
+            <div class="form-text">
+              Pause between playlist videos to avoid YouTube's 429 rate limiting. The first video
+              starts immediately.
+            </div>
           </div>
           <div class="col-12">
             <label class="form-label">Extra yt-dlp arguments</label>

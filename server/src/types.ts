@@ -32,6 +32,9 @@ export type Download = {
   finishedAt: number | null
   // The original request, kept so the job can be retried with the same options
   request?: NewDownloadRequest
+  // Automatic retries consumed after cookie-related failures; reset on manual
+  // start/retry so the cap applies per user action
+  autoRetries?: number
 }
 
 export type CookieCloudSettings = {

@@ -29,6 +29,7 @@ export type Download = {
   createdAt: number
   finishedAt: number | null
   request?: NewDownloadRequest
+  autoRetries?: number
 }
 
 export type NewDownloadRequest = {
